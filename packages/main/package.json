@@ -14,7 +14,8 @@
   "dependencies": {
     "@app/preload": "*",
     "@app/renderer": "*",
-    "electron-updater": "6.6.2"
+    "electron-updater": "6.6.2",
+    "axios": "^1.7.9"
   },
   "devDependencies": {
     "@app/electron-versions": "*",
