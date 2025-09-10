@@ -137,18 +137,45 @@ export default function Settings() {
       </Flex>
 
       <Flex gap="3" wrap="wrap">
-        <TextField.Root placeholder="Provider" value={cfg.provider} onChange={(e) => update('provider', e.target.value)} />
-        <TextField.Root placeholder="Model" value={cfg.model} onChange={(e) => update('model', e.target.value)} />
-        <TextField.Root placeholder="API Key" type="password" value={cfg.apiKey||''} onChange={(e) => update('apiKey', e.target.value)} />
-        <TextField.Root placeholder="Dispatcher Base URL" value={cfg.baseUrl} onChange={(e) => update('baseUrl', e.target.value)} />
-        <TextField.Root placeholder="Bridge Token" value={cfg.bridgeToken||''} onChange={(e) => update('bridgeToken', e.target.value)} />
+        <Flex direction="column">
+          <Text>Provider</Text>
+          <TextField.Root value={cfg.provider} onChange={(e) => update('provider', e.target.value)} />
+        </Flex>
+        <Flex direction="column">
+          <Text>Model</Text>
+          <TextField.Root value={cfg.model} onChange={(e) => update('model', e.target.value)} />
+        </Flex>
+        <Flex direction="column">
+          <Text>API Key</Text>
+          <TextField.Root type="password" value={cfg.apiKey||''} onChange={(e) => update('apiKey', e.target.value)} />
+        </Flex>
+        <Flex direction="column">
+          <Text>Dispatcher Base URL</Text>
+          <TextField.Root value={cfg.baseUrl} onChange={(e) => update('baseUrl', e.target.value)} />
+        </Flex>
+        <Flex direction="column">
+          <Text>Bridge Token</Text>
+          <TextField.Root value={cfg.bridgeToken||''} onChange={(e) => update('bridgeToken', e.target.value)} />
+        </Flex>
       </Flex>
 
       <Flex gap="3" wrap="wrap">
-        <TextField.Root placeholder="Temperature" value={String(cfg.temperature)} onChange={(e) => update('temperature', Number(e.target.value))} />
-        <TextField.Root placeholder="Max Tokens" value={String(cfg.maxTokens)} onChange={(e) => update('maxTokens', Number(e.target.value))} />
-        <TextField.Root placeholder="Max Steps" value={String(cfg.maxSteps)} onChange={(e) => update('maxSteps', Number(e.target.value))} />
-        <TextField.Root placeholder="Max Turn Ms" value={String(cfg.maxTurnMs)} onChange={(e) => update('maxTurnMs', Number(e.target.value))} />
+        <Flex direction="column">
+          <Text>Temperature</Text>
+          <TextField.Root value={String(cfg.temperature)} onChange={(e) => update('temperature', Number(e.target.value))} />
+        </Flex>
+        <Flex direction="column">
+          <Text>Max Tokens</Text>
+          <TextField.Root value={String(cfg.maxTokens)} onChange={(e) => update('maxTokens', Number(e.target.value))} />
+        </Flex>
+        <Flex direction="column">
+          <Text>Max Steps</Text>
+          <TextField.Root value={String(cfg.maxSteps)} onChange={(e) => update('maxSteps', Number(e.target.value))} />
+        </Flex>
+        <Flex direction="column">
+          <Text>Decision Timeout (ms)</Text>
+          <TextField.Root value={String(cfg.maxTurnMs)} onChange={(e) => update('maxTurnMs', Number(e.target.value))} />
+        </Flex>
       </Flex>
 
       <Flex gap="3" wrap="wrap" align="center">
@@ -178,14 +205,26 @@ export default function Settings() {
       </Flex>
 
       <Flex gap="3" wrap="wrap">
-        <TextField.Root placeholder="Min Temp" value={String(cfg.minTemp||0)} onChange={(e) => update('minTemp', Number(e.target.value))} />
-        <TextField.Root placeholder="Max Temp" value={String(cfg.maxTemp||0)} onChange={(e) => update('maxTemp', Number(e.target.value))} />
-        <TextField.Root placeholder="N-Best" value={String(cfg.nBest||1)} onChange={(e) => update('nBest', Number(e.target.value))} />
+        <Flex direction="column">
+          <Text>Min Temp</Text>
+          <TextField.Root value={String(cfg.minTemp||0)} onChange={(e) => update('minTemp', Number(e.target.value))} />
+        </Flex>
+        <Flex direction="column">
+          <Text>Max Temp</Text>
+          <TextField.Root value={String(cfg.maxTemp||0)} onChange={(e) => update('maxTemp', Number(e.target.value))} />
+        </Flex>
+        <Flex direction="column">
+          <Text>N-Best</Text>
+          <TextField.Root value={String(cfg.nBest||1)} onChange={(e) => update('nBest', Number(e.target.value))} />
+        </Flex>
         <Flex align="center" gap="2">
           <Switch checked={!!cfg.nBestParallel} onCheckedChange={(v) => update('nBestParallel', !!v)} />
           <Text>N-Best Parallel</Text>
         </Flex>
-        <TextField.Root placeholder="Max Actions" value={String(cfg.maxActions||24)} onChange={(e) => update('maxActions', Number(e.target.value))} />
+        <Flex direction="column">
+          <Text>Max Actions</Text>
+          <TextField.Root value={String(cfg.maxActions||24)} onChange={(e) => update('maxActions', Number(e.target.value))} />
+        </Flex>
       </Flex>
 
       <Flex direction="column" gap="2">

@@ -66,6 +66,38 @@ const DEFAULT_CFG: AgentConfig = {
   nBestParallel: false,
   maxActions: 24,
   knowledge: {weight: 0.6},
+  systemPrompt: `你是一名策略卡牌战棋游戏的 AI，目标是通过合理出牌、放置单位、移动与攻击来击败对手（将对手生命降为 0）。
+
+规则与世界观（简要）：
+- 回合制：我方与对方轮流行动，turn 表示当前局面所处的回合编号（约等于双方总回合数/2）。Round 从 1 递增。
+- 资源：我方 self.mana 表示当前可用法力；打出手牌（hand）会消耗 mana（mana_cost）。
+- 手牌（hand）：每张卡牌包含 card_id、name、mana_cost、type（Unit/Spell/...）、desc（描述）。
+- 单位：棋盘上的单位包含 id、card_id、name、hp、atk、cell_index（格子索引，从 0 开始）、can_attack、skills（单位技能名列表）。
+- 我方单位在 self_units，敌方单位在 enemy_units。单位的攻击通常是单体近战/远程，满足技能/范围规则即可攻击。
+- 英雄能量：可能存在 hero 能量与能量技（如有展示在 snapshot 中）。
+- 放置规则：Unit 类型卡牌通常需要放在可放置的格子（由引擎控制合法性），动作中会给出 cell_index。
+
+棋盘与坐标：
+- 棋盘宽度 board.width（W），格子索引 cell_index 从左到右、从上到下递增。行号 row = floor(cell_index / W)，列号 col = cell_index % W。
+- 如果需要描述相邻与距离，可使用曼哈顿距离和/或引擎提供的范围（动作/技能会保证合法性）。
+
+可选动作（available_actions）：
+- play_card：在指定 cell_index 打出一张手牌（可能附带 card_name、mana_cost、type、desc）。
+- unit_attack：某个单位对目标单位发动攻击（可能附带 attacker/target 的 {name, atk, hp}）。
+- use_skill：单位使用主动技能（可能附带 skill_name 与目标 cell_index）。
+- move_unit：将单位移动到目标格（move_unit.to_cell_index，可能附带 from_cell_index）。
+- hero_power：使用英雄技能（若存在）。
+- end_turn：结束回合。
+
+注意：
+- 如果只存在 end_turn，则选择 end_turn。
+- 若可以在护甲/血量优势下抢攻且能达成击杀或压制，优先攻击。若法力不足以有效出牌，选择低费或结束回合。
+- 尽量避免无意义移动或空过，兼顾法力曲线与场面交换。
+
+输出要求（严格遵守其一）：
+1) 文本格式：Action: <id>
+2) JSON 格式（如被要求工具调用或 json_strict）：{"action_id": <id>}
+禁止输出除上述之外的多余内容。`
 };
 
 export class AgentModule implements AppModule {
@@ -74,6 +106,8 @@ export class AgentModule implements AppModule {
   #socket: Socket | null = null;
   #buffer = '';
   #inflight: {reqId: string; ts: number} | null = null;
+  #deciding = false;
+  #actionsGen = 0;
   #axios: AxiosInstance;
   #cfg: AgentConfig = {...DEFAULT_CFG};
   #configPath = '';
@@ -86,7 +120,7 @@ export class AgentModule implements AppModule {
   constructor({host = '127.0.0.1', port = 17771}: {host?: string; port?: number} = {}) {
     this.#host = host;
     this.#port = port;
-    this.#axios = axios.create({timeout: 15000});
+    this.#axios = axios.create({timeout: 15000, headers: {'Content-Type': 'application/json; charset=utf-8'}});
   }
 
   async enable({app}: ModuleContext): Promise<void> {
@@ -96,7 +130,10 @@ export class AgentModule implements AppModule {
     this.#axios = axios.create({
       baseURL: this.#cfg.baseUrl,
       timeout: 15000,
-      headers: this.#cfg.apiKey ? {Authorization: `Bearer ${this.#cfg.apiKey}`} : undefined,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        ...(this.#cfg.apiKey ? {Authorization: `Bearer ${this.#cfg.apiKey}`} : {})
+      },
     });
 
     this.#initIpc();
@@ -174,7 +211,10 @@ export class AgentModule implements AppModule {
       this.#axios = axios.create({
         baseURL: this.#cfg.baseUrl,
         timeout: 15000,
-        headers: this.#cfg.apiKey ? {Authorization: `Bearer ${this.#cfg.apiKey}`} : undefined,
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          ...(this.#cfg.apiKey ? {Authorization: `Bearer ${this.#cfg.apiKey}`} : {})
+        },
       });
     }
   }
@@ -243,7 +283,15 @@ export class AgentModule implements AppModule {
       case 'available_actions': {
         const actions = (msg as any).actions || [];
         this.#lastActions = actions;
-        this.#stepDecision(actions).catch(console.error);
+        const gen = ++this.#actionsGen;
+        try {
+          const summary = this.#summarizeActions(actions);
+          console.log('[agent] available_actions received', {gen, count: actions.length, summary});
+          try { console.log('[agent] available_actions raw', JSON.stringify(actions)); } catch {}
+          const preview = Array.isArray(actions) ? actions.slice(0, 30) : [];
+          this.#broadcast('available_actions', {gen, count: actions.length, preview});
+        } catch {}
+        this.#stepDecision(actions, gen).catch(console.error);
         break;
       }
       case 'action_result':
@@ -269,7 +317,8 @@ export class AgentModule implements AppModule {
   }
 
   #watchdog() {
-    const DECISION_TIMEOUT_MS = 6000;
+    const cfgTimeout = Number(this.#cfg.maxTurnMs);
+    const DECISION_TIMEOUT_MS = Number.isFinite(cfgTimeout) && cfgTimeout > 0 ? Math.max(2000, Math.min(60000, cfgTimeout)) : 6000;
     if (this.#inflight && Date.now() - this.#inflight.ts > DECISION_TIMEOUT_MS) {
       console.warn('[agent] decision timeout, trying fallback end_turn');
       this.#inflight = null;
@@ -279,6 +328,7 @@ export class AgentModule implements AppModule {
   }
 
   #sendAction(actionId: number) {
+    if (this.#inflight) { try { console.log('[agent] sendAction skipped: inflight'); } catch {} return; }
     const reqId = randomUUID();
     this.#send({type: 'select_action', id: actionId, req_id: reqId});
     this.#inflight = {reqId, ts: Date.now()};
@@ -286,21 +336,30 @@ export class AgentModule implements AppModule {
     this.#broadcast('decision_log', {actionId, info: 'step++', steps: this.#turn.steps});
   }
 
-  async #stepDecision(actions: any[]) {
+  async #stepDecision(actions: any[], gen?: number) {
     if (!Array.isArray(actions) || actions.length === 0) return;
-    if (this.#paused) return;
-    if (this.#inflight) return;
+    if (this.#paused) { try { console.log('[agent] stepDecision skipped: paused'); } catch {} return; }
+    if (this.#inflight) { try { console.log('[agent] stepDecision skipped: inflight'); } catch {} return; }
+    if (this.#deciding) { try { console.log('[agent] stepDecision skipped: deciding'); } catch {} return; }
+    // Short-circuit: only end_turn
+    if (actions.length === 1 && actions[0] && actions[0].end_turn) { return this.#sendAction(actions[0].id); }
+    this.#deciding = true;
+    try { console.log('[agent] stepDecision start', {gen, actions: actions.length}); } catch {}
 
     try {
       const chosen = await this.#decide(actions);
+      // Drop stale decision if a newer gen arrived meanwhile
+      if (gen != null && gen !== this.#actionsGen) { try { console.log('[agent] decision dropped: stale', {gen, latest: this.#actionsGen}); } catch {} return; }
       if (chosen == null) return this.#autoPlay(actions);
       const exists = actions.some(a => a && a.id === chosen);
       if (!exists) return this.#autoPlay(actions);
-      this.#broadcast('decision_explain', {mode: this.#cfg.decisionMode, turn: this.#lastSnapshot?.turn, steps: this.#turn.steps});
+      this.#broadcast('decision_explain', {mode: this.#cfg.decisionMode, turn: this.#lastSnapshot?.turn, steps: this.#turn.steps, gen});
       this.#sendAction(chosen);
     } catch (e) {
       console.error('[agent] decide error', e);
       this.#autoPlay(actions);
+    } finally {
+      this.#deciding = false;
     }
   }
 
@@ -319,6 +378,7 @@ export class AgentModule implements AppModule {
 
     const situation = this.#scoreSituation(this.#lastSnapshot, actions);
     const modeUse = this.#chooseMode(this.#cfg.decisionMode || 'json_strict', situation);
+    try { console.log('[agent] decide()', {modeUse, provider: this.#cfg.provider, model: this.#cfg.model, actions: actions.length}); } catch {}
 
     if (modeUse === 'policy_only') {
       this.#autoPlay(actions);
@@ -326,6 +386,7 @@ export class AgentModule implements AppModule {
     }
 
     const pruned = this.#pruneActions(actions, this.#cfg.maxActions || 24);
+    try { console.log('[agent] decide() pruned', {count: Array.isArray(pruned)?pruned.length:0}); } catch {}
     const prompt = this.#buildDecisionPrompt(this.#lastSnapshot, pruned);
     const temp = this.#computeTemperature(this.#lastSnapshot, pruned, situation);
 
@@ -356,6 +417,7 @@ export class AgentModule implements AppModule {
       };
       const res = await this.#callDispatcher(payload);
       const text = this.#extractText(res.data);
+      try { console.log('[agent] rank_then_choose response', String(text||'').slice(0,300)); } catch {}
       const ranking = this.#parseRankingList(text, pruned) || [];
       const chosenId = this.#selectFromRankingWithKnowledge(pruned, ranking, this.#turn, this.#lastSnapshot);
       if (chosenId != null) {
@@ -381,6 +443,7 @@ export class AgentModule implements AppModule {
     const res = await this.#callDispatcher(payload);
     const fromTool = this.#parseToolChoiceFromResponse(res.data, pruned);
     const text = fromTool == null ? this.#extractText(res.data) : null;
+    try { console.log('[agent] dispatcher response', {toolChoice: fromTool, text: String(text||'').slice(0,300)}); } catch {}
     let id = fromTool != null ? fromTool : this.#parseActionId(text, pruned);
     if (id != null) {
       // avoid very early end_turn if there are other options
@@ -390,8 +453,9 @@ export class AgentModule implements AppModule {
         if (alt) id = alt.id;
       }
       if (id != null) {
+        const why = this.#extractBriefReason(text);
         this.#broadcast('decision_log', {actionId: id, text: String(text||'').slice(0,120)});
-        this.#broadcast('decision_explain', {mode: modeUse, temp, turn: this.#lastSnapshot?.turn, steps: this.#turn.steps, situation});
+        this.#broadcast('decision_explain', {mode: modeUse, temp, turn: this.#lastSnapshot?.turn, steps: this.#turn.steps, situation, why});
       }
     }
     return id;
@@ -520,6 +584,22 @@ export class AgentModule implements AppModule {
     if (a?.play_card) return `Play card=${a.play_card.card_id} @ ${a.play_card.cell_index}`;
     if (a?.end_turn) return 'End Turn';
     return 'Unknown';
+  }
+
+  #summarizeActions(actions: any[]) {
+    try {
+      const sum = {end:0, play:0, atk:0, move:0, skill:0, power:0, unknown:0};
+      for (const a of (actions||[])) {
+        if (a?.end_turn) sum.end++;
+        else if (a?.play_card) sum.play++;
+        else if (a?.unit_attack) sum.atk++;
+        else if (a?.move_unit) sum.move++;
+        else if (a?.use_skill) sum.skill++;
+        else if (a?.hero_power) sum.power++;
+        else sum.unknown++;
+      }
+      return sum;
+    } catch { return null; }
   }
 
   // --- Advanced decision helpers ---
@@ -758,6 +838,18 @@ export class AgentModule implements AppModule {
     try { if (current === 'policy_only') return current; return situation?.modePrefer || current || 'json_strict'; } catch { return current || 'json_strict'; }
   }
 
+  #extractBriefReason(text: string | null) {
+    try {
+      if (!text) return undefined;
+      const t = String(text);
+      const m = t.match(/reason\s*[:：]\s*(.+)$/i);
+      if (m && m[1]) return m[1].slice(0, 120);
+      // fallback: first sentence
+      const sent = t.split(/\n|\.|。/)[0];
+      return sent ? sent.slice(0, 120) : undefined;
+    } catch { return undefined; }
+  }
+
   #buildToolFunctions(actions: any[]) {
     try {
       const playCards = actions.filter(a => a?.play_card);
@@ -798,7 +890,7 @@ export class AgentModule implements AppModule {
       }
       const actionIds = Array.from(new Set((actions||[]).map((a:any) => a?.id).filter((x:any) => Number.isFinite(x))));
       if (actionIds.length) {
-        tools.push({ type: 'function', function: { name: 'choose_action', description: 'Choose exactly one action by id from the allowed enum.', parameters: { type: 'object', properties: { action_id: { type: 'number', enum: actionIds } }, required: ['action_id'] } } });
+        tools.push({ type: 'function', function: { name: 'choose_action', description: 'Choose exactly one action by id from the allowed enum. Optionally provide a brief why (<=120 chars).', parameters: { type: 'object', properties: { action_id: { type: 'number', enum: actionIds }, why: { type: 'string' } }, required: ['action_id'] } } });
       }
       return tools;
     } catch { return []; }
@@ -814,7 +906,11 @@ export class AgentModule implements AppModule {
         let args: any = {};
         try { args = c.function.arguments ? JSON.parse(c.function.arguments) : {}; } catch {}
         const id = this.#mapToolCallToActionId(c.function.name, args, actions);
-        if (id != null) return id;
+        if (id != null) {
+          const why = typeof args?.why === 'string' ? String(args.why).slice(0,120) : undefined;
+          if (why) { try { this.#broadcast('decision_explain', {why}); } catch {} }
+          return id;
+        }
       }
       return null as number | null;
     } catch { return null; }

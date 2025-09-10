@@ -5,7 +5,7 @@ export default function Agent() {
   const [logs, setLogs] = useState<string[]>([])
   const [paused, setPaused] = useState<boolean>(false)
   const [rt, setRt] = useState<{turn?: string; steps?: string; temp?: string; mode?: string}>({})
-  const [decisions, setDecisions] = useState<Array<{ts:number; actionId:number; text?:string}>>([])
+  const [decisions, setDecisions] = useState<Array<{ts:number; actionId:number; text?:string; why?: string; turn?: string; gen?: number}>>([])
 
   useEffect(() => {
     // @ts-expect-error preload
@@ -17,9 +17,13 @@ export default function Agent() {
       setLogs(prev => [...prev.slice(-200), ln])
     }
     const onExplain = (_: any, data: any) => {
-      const ln = `[Explain] mode=${data?.mode ?? ''} temp=${data?.temp ?? ''}`
+      const why = data?.why ? ` why=${String(data.why).slice(0,120)}` : ''
+      const ln = `[Explain] mode=${data?.mode ?? ''} temp=${data?.temp ?? ''}${why}`
       setLogs(prev => [...prev.slice(-200), ln])
       setRt(prev => ({...prev, mode: String(data?.mode ?? ''), temp: data?.temp != null ? String(data.temp) : prev.temp, steps: data?.steps != null ? String(data.steps) : prev.steps, turn: data?.turn != null ? String(data.turn) : prev.turn}))
+      if (data?.actionId) {
+        setDecisions(prev => [...prev, { ts: Date.now(), actionId: data.actionId, text: undefined, why: data?.why, turn: String(data?.turn ?? ''), gen: data?.gen }].slice(-500))
+      }
     }
     const onCfgLoaded = (_: any, data: any) => {
       setLogs(prev => [...prev.slice(-200), `[CFG] loaded provider=${data?.provider ?? ''} model=${data?.model ?? ''}`])
