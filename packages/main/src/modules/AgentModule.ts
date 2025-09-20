@@ -29,7 +29,7 @@ type AgentConfig = {
   maxTurnMs: number;
   endpoint?: string;
   systemPrompt?: string;
-  decisionMode?: 'json_strict'|'tool_call'|'rank_then_choose'|'policy_only';
+  decisionMode?: 'intent'|'policy_only';
   strategyProfile?: 'balanced'|'aggressive'|'defensive';
   adaptiveTemp?: boolean;
   minTemp?: number;
@@ -45,6 +45,7 @@ type AgentConfig = {
     cards?: string;
   };
   paused?: boolean;
+  orientationOverride?: 'auto'|'as_is'|'flipped';
 };
 
 const DEFAULT_CFG: AgentConfig = {
@@ -52,12 +53,12 @@ const DEFAULT_CFG: AgentConfig = {
   model: 'gpt-4o-mini',
   baseUrl: 'http://localhost:3000',
   bridgeToken: 'dev',
-  temperature: 0.2,
+  temperature: 0.15,
   maxTokens: 512,
   maxSteps: 6,
   maxTurnMs: 12000,
   endpoint: 'chat/completions',
-  decisionMode: 'json_strict',
+  decisionMode: 'intent',
   strategyProfile: 'balanced',
   adaptiveTemp: true,
   minTemp: 0.1,
@@ -66,38 +67,27 @@ const DEFAULT_CFG: AgentConfig = {
   nBestParallel: false,
   maxActions: 24,
   knowledge: {weight: 0.6},
-  systemPrompt: `你是一名策略卡牌战棋游戏的 AI，目标是通过合理出牌、放置单位、移动与攻击来击败对手（将对手生命降为 0）。
+  systemPrompt: `你是策略卡牌战棋游戏的 AI，只基于给定战局信息做决策。
 
-规则与世界观（简要）：
-- 回合制：我方与对方轮流行动，turn 表示当前局面所处的回合编号（约等于双方总回合数/2）。Round 从 1 递增。
-- 资源：我方 self.mana 表示当前可用法力；打出手牌（hand）会消耗 mana（mana_cost）。
-- 手牌（hand）：每张卡牌包含 card_id、name、mana_cost、type（Unit/Spell/...）、desc（描述）。
-- 单位：棋盘上的单位包含 id、card_id、name、hp、atk、cell_index（格子索引，从 0 开始）、can_attack、skills（单位技能名列表）。
-- 我方单位在 self_units，敌方单位在 enemy_units。单位的攻击通常是单体近战/远程，满足技能/范围规则即可攻击。
-- 英雄能量：可能存在 hero 能量与能量技（如有展示在 snapshot 中）。
-- 放置规则：Unit 类型卡牌通常需要放在可放置的格子（由引擎控制合法性），动作中会给出 cell_index。
+严格输出 JSON（不含任何多余文本）：
+{
+  "action": {
+    "type": "play_card|move|unit_attack|hero_power|end_turn",
+    // 当 type=play_card:  {"card_id": number, "to": {"row": number, "col": number}|"rXcY"|{"cell_index": number}}
+    // 当 type=move:       {"unit_id": number, "to": {"row": number, "col": number}|"rXcY"|{"to_cell_index": number}}
+    // 当 type=unit_attack:{"attacker_unit_id": number, "target_unit_id": number}
+    // 当 type=hero_power: {"target"?: {"row": number, "col": number}|"rXcY"|{"cell_index": number}}
+  },
+  "rationale": "<=20字简要理由"
+}
 
-棋盘与坐标：
-- 棋盘宽度 board.width（W），格子索引 cell_index 从左到右、从上到下递增。行号 row = floor(cell_index / W)，列号 col = cell_index % W。
-- 如果需要描述相邻与距离，可使用曼哈顿距离和/或引擎提供的范围（动作/技能会保证合法性）。
-
-可选动作（available_actions）：
-- play_card：在指定 cell_index 打出一张手牌（可能附带 card_name、mana_cost、type、desc）。
-- unit_attack：某个单位对目标单位发动攻击（可能附带 attacker/target 的 {name, atk, hp}）。
-- use_skill：单位使用主动技能（可能附带 skill_name 与目标 cell_index）。
-- move_unit：将单位移动到目标格（move_unit.to_cell_index，可能附带 from_cell_index）。
-- hero_power：使用英雄技能（若存在）。
-- end_turn：结束回合。
-
-注意：
-- 如果只存在 end_turn，则选择 end_turn。
-- 若可以在护甲/血量优势下抢攻且能达成击杀或压制，优先攻击。若法力不足以有效出牌，选择低费或结束回合。
-- 尽量避免无意义移动或空过，兼顾法力曲线与场面交换。
-
-输出要求（严格遵守其一）：
-1) 文本格式：Action: <id>
-2) JSON 格式（如被要求工具调用或 json_strict）：{"action_id": <id>}
-禁止输出除上述之外的多余内容。`
+约束：
+- 不要臆造手牌或单位；ID 与坐标必须来自观测。
+- 若无法找到合理行动，输出 end_turn。
+- 优先级：解威胁 > 站位安全 > 法力效率 > 场面收益。
+- 禁止输出动作 id；禁止输出自由文本；严格遵循上述 JSON 结构。`
+  ,
+  orientationOverride: 'auto',
 };
 
 export class AgentModule implements AppModule {
@@ -116,6 +106,7 @@ export class AgentModule implements AppModule {
   #turn = {startedAt: 0, steps: 0};
   #paused = false;
   #reconnectTimer: NodeJS.Timeout | null = null;
+  #orientation: 'as_is'|'flipped' = 'as_is';
 
   constructor({host = '127.0.0.1', port = 17771}: {host?: string; port?: number} = {}) {
     this.#host = host;
@@ -270,24 +261,35 @@ export class AgentModule implements AppModule {
         break;
       case 'game_ready':
         console.log('[agent] game_ready');
+        (this as any)._gameOver = false;
         break;
       case 'game_over':
         console.log('[agent] game_over');
         this.#inflight = null;
+        (this as any)._gameOver = true;
         break;
       case 'state':
         this.#lastSnapshot = (msg as any).snapshot ?? null;
         this.#updateTurnState();
+        try {
+          const yhp = Number(this.#lastSnapshot?.you?.hero_hp);
+          const ohp = Number(this.#lastSnapshot?.opponent?.hero_hp);
+          if (Number.isFinite(yhp) && yhp <= 0) (this as any)._gameOver = true;
+          if (Number.isFinite(ohp) && ohp <= 0) (this as any)._gameOver = true;
+        } catch {}
         try { this.#broadcast('state', {snapshot: this.#lastSnapshot}); } catch {}
         break;
       case 'available_actions': {
+        if ((this as any)._gameOver) { break; }
         const actions = (msg as any).actions || [];
         this.#lastActions = actions;
+        // detect orientation if needed
+        try { this.#updateOrientation(actions); } catch {}
         const gen = ++this.#actionsGen;
         try {
           const summary = this.#summarizeActions(actions);
           console.log('[agent] available_actions received', {gen, count: actions.length, summary});
-          try { console.log('[agent] available_actions raw', JSON.stringify(actions)); } catch {}
+          try { console.log('[agent] available_actions raw', this.#summarizeActionsVerbose(actions)); } catch {}
           const preview = Array.isArray(actions) ? actions.slice(0, 30) : [];
           this.#broadcast('available_actions', {gen, count: actions.length, preview});
         } catch {}
@@ -300,6 +302,14 @@ export class AgentModule implements AppModule {
       case 'error':
         console.error('[agent] error', (msg as any).message);
         break;
+      case 'action_error': {
+        const id = (msg as any).id;
+        const reason = (msg as any).reason;
+        try {
+          this.#broadcast('decision_log', {actionId: id ?? null, error: reason || 'action error'});
+        } catch {}
+        break;
+      }
       default:
         break;
     }
@@ -312,6 +322,7 @@ export class AgentModule implements AppModule {
       if (String(t) !== String((this as any)._lastTurnId || '')) {
         (this as any)._lastTurnId = String(t);
         this.#turn = {startedAt: Date.now(), steps: 0};
+        (this as any)._endedThisTurn = false;
       }
     } catch {}
   }
@@ -334,15 +345,23 @@ export class AgentModule implements AppModule {
     this.#inflight = {reqId, ts: Date.now()};
     this.#turn.steps = (this.#turn.steps || 0) + 1;
     this.#broadcast('decision_log', {actionId, info: 'step++', steps: this.#turn.steps});
+    try {
+      const a = (this.#lastActions||[]).find((x:any)=>x&&x.id===actionId);
+      if (a && a.end_turn) (this as any)._endedThisTurn = true;
+    } catch {}
   }
 
   async #stepDecision(actions: any[], gen?: number) {
     if (!Array.isArray(actions) || actions.length === 0) return;
+    if ((this as any)._gameOver) { try { console.log('[agent] stepDecision skipped: game_over'); } catch {} return; }
     if (this.#paused) { try { console.log('[agent] stepDecision skipped: paused'); } catch {} return; }
     if (this.#inflight) { try { console.log('[agent] stepDecision skipped: inflight'); } catch {} return; }
     if (this.#deciding) { try { console.log('[agent] stepDecision skipped: deciding'); } catch {} return; }
     // Short-circuit: only end_turn
-    if (actions.length === 1 && actions[0] && actions[0].end_turn) { return this.#sendAction(actions[0].id); }
+    if (actions.length === 1 && actions[0] && actions[0].end_turn) {
+      if ((this as any)._endedThisTurn) { try { console.log('[agent] skip end_turn: already ended this turn'); } catch {} return; }
+      return this.#sendAction(actions[0].id);
+    }
     this.#deciding = true;
     try { console.log('[agent] stepDecision start', {gen, actions: actions.length}); } catch {}
 
@@ -375,90 +394,245 @@ export class AgentModule implements AppModule {
 
   async #decide(actions: any[]): Promise<number | null> {
     if (!this.#cfg.baseUrl || !this.#cfg.provider) return null;
+    if (this.#cfg.decisionMode === 'policy_only') { this.#autoPlay(actions); return null; }
+    return await this.#decideIntent(actions, this.#lastSnapshot);
+  }
 
-    const situation = this.#scoreSituation(this.#lastSnapshot, actions);
-    const modeUse = this.#chooseMode(this.#cfg.decisionMode || 'json_strict', situation);
-    try { console.log('[agent] decide()', {modeUse, provider: this.#cfg.provider, model: this.#cfg.model, actions: actions.length}); } catch {}
-
-    if (modeUse === 'policy_only') {
-      this.#autoPlay(actions);
-      return null;
-    }
-
-    const pruned = this.#pruneActions(actions, this.#cfg.maxActions || 24);
-    try { console.log('[agent] decide() pruned', {count: Array.isArray(pruned)?pruned.length:0}); } catch {}
-    const prompt = this.#buildDecisionPrompt(this.#lastSnapshot, pruned);
-    const temp = this.#computeTemperature(this.#lastSnapshot, pruned, situation);
-
-    // N-best if configured
-    const nbestN = Math.max(1, Math.min(8, Math.floor(this.#cfg.nBest || 1)));
-    if (nbestN > 1) {
-      const nres = await this.#nbestDecide(pruned, this.#lastSnapshot, prompt, temp, {
-        n: nbestN,
-        parallel: !!this.#cfg.nBestParallel,
-      });
-      if (nres && nres.actionId != null && pruned.some(a => a.id === nres.actionId)) {
-        this.#broadcast('decision_log', {actionId: nres.actionId, text: String(nres.text||'').slice(0,120)});
-        this.#broadcast('decision_explain', {mode: modeUse, temp: nres.temp, turn: this.#lastSnapshot?.turn, steps: this.#turn.steps, nBest: nbestN, parallel: !!this.#cfg.nBestParallel, explain: nres.explain, situation});
-        return nres.actionId;
-      }
-    }
-
-    // Rank-then-choose
-    if (modeUse === 'rank_then_choose') {
+  async #decideIntent(actions: any[], snapshot: any): Promise<number | null> {
+    try {
+      const observation = this.#buildObservation(snapshot);
+      const userContent = this.#buildIntentUserMessage(observation);
       const payload = {
         model: this.#cfg.model,
         messages: [
-          {role: 'system', content: 'Rank actions from best to worst. Output JSON {"ranking":[id,...]} only.'},
-          {role: 'user', content: this.#buildRankingPrompt(this.#lastSnapshot, pruned)},
+          {role: 'system', content: this.#cfg.systemPrompt || '严格输出 JSON 意图'},
+          {role: 'user', content: userContent},
         ],
-        temperature: Math.min(temp, 0.3),
-        max_tokens: Math.max(128, this.#cfg.maxTokens || 256),
+        temperature: this.#clampTemp(this.#cfg.temperature ?? 0.15),
+        max_tokens: Math.max(192, this.#cfg.maxTokens || 256),
       };
       const res = await this.#callDispatcher(payload);
       const text = this.#extractText(res.data);
-      try { console.log('[agent] rank_then_choose response', String(text||'').slice(0,300)); } catch {}
-      const ranking = this.#parseRankingList(text, pruned) || [];
-      const chosenId = this.#selectFromRankingWithKnowledge(pruned, ranking, this.#turn, this.#lastSnapshot);
-      if (chosenId != null) {
-        this.#broadcast('decision_log', {actionId: chosenId, ranking, text: String(text||'').slice(0,120)});
-        this.#broadcast('decision_explain', {mode: 'rank_then_choose', temp, turn: this.#lastSnapshot?.turn, steps: this.#turn.steps, ranking, situation});
-        return chosenId;
+      const intent = this.#parseIntentObject(text);
+      let compiled = this.#compileIntentToActionId(intent, actions, snapshot);
+      console.log(`[agent] intent received:`, text);
+      console.log(`[agent] intent parsed:`, intent);
+      console.log(`[agent] compiled result:`, compiled);
+      if (compiled && compiled.id != null) {
+        const why = typeof intent?.rationale === 'string' ? String(intent.rationale).slice(0, 120) : undefined;
+        const actionDetail = actions.find(a => a.id === compiled.id);
+        console.log(`[agent] executing action ${compiled.id}: ${this.#serializeAction(actionDetail)} (${why || 'no rationale'})`);
+        this.#broadcast('decision_log', {actionId: compiled.id, intent, compiled, rationale: why, action: actionDetail});
+        if (why) this.#broadcast('decision_explain', {mode: 'intent', why});
+        return compiled.id;
       }
-      // fallback to strict
+      // one-shot self-correction
+      const errMsg = compiled?.error || 'illegal or non-executable intent';
+      const retryMessages = [
+        {role: 'system', content: this.#cfg.systemPrompt || '严格输出 JSON 意图'},
+        {role: 'user', content: userContent},
+        {role: 'assistant', content: typeof text === 'string' ? text : ''},
+        {role: 'user', content: `上一次的意图无法执行：${errMsg}。请基于相同观测重新给出可执行的意图，注意：不得臆造单位/手牌/坐标；若不确定则 end_turn。只输出严格 JSON。`},
+      ];
+      const res2 = await this.#callDispatcher({ model: this.#cfg.model, messages: retryMessages, temperature: this.#clampTemp(this.#cfg.temperature ?? 0.15), max_tokens: Math.max(192, this.#cfg.maxTokens || 256) });
+      const text2 = this.#extractText(res2.data);
+      const intent2 = this.#parseIntentObject(text2);
+      compiled = this.#compileIntentToActionId(intent2, actions, snapshot);
+      console.log(`[agent] retry intent received:`, text2);
+      console.log(`[agent] retry compiled result:`, compiled);
+      if (compiled && compiled.id != null) {
+        const why = typeof intent2?.rationale === 'string' ? String(intent2.rationale).slice(0, 120) : undefined;
+        const actionDetail = actions.find(a => a.id === compiled.id);
+        console.log(`[agent] executing action ${compiled.id} (retry): ${this.#serializeAction(actionDetail)} (${why || 'no rationale'})`);
+        this.#broadcast('decision_log', {actionId: compiled.id, intent: intent2, compiled, rationale: why, action: actionDetail, retry: true});
+        if (why) this.#broadcast('decision_explain', {mode: 'intent', why, retry: true});
+        return compiled.id;
+      }
+      console.log(`[agent] both attempts failed, returning null`);
+      this.#broadcast('decision_log', {actionId: null, error: 'failed after retry', originalError: errMsg, intent: intent2});
+      return null;
+    } catch (e) {
+      console.error('[agent] decideIntent error', e);
+      return null;
     }
+  }
 
-    // json_strict or tool_call
-    const payload = {
-      model: this.#cfg.model,
-      messages: [
-        {role: 'system', content: this.#cfg.systemPrompt || 'Return strictly: Action: <id>'},
-        {role: 'user', content: prompt},
-      ],
-      temperature: temp,
-      max_tokens: this.#cfg.maxTokens || 256,
-      tools: modeUse === 'tool_call' ? this.#buildToolFunctions(pruned) : undefined,
-      tool_choice: modeUse === 'tool_call' ? 'auto' as const : undefined,
-    };
-    const res = await this.#callDispatcher(payload);
-    const fromTool = this.#parseToolChoiceFromResponse(res.data, pruned);
-    const text = fromTool == null ? this.#extractText(res.data) : null;
-    try { console.log('[agent] dispatcher response', {toolChoice: fromTool, text: String(text||'').slice(0,300)}); } catch {}
-    let id = fromTool != null ? fromTool : this.#parseActionId(text, pruned);
-    if (id != null) {
-      // avoid very early end_turn if there are other options
-      const chosen = pruned.find(a => a.id === id);
-      if (chosen?.end_turn && this.#isPrematureEndTurn(this.#turn)) {
-        const alt = pruned.find(a => !a.end_turn);
-        if (alt) id = alt.id;
-      }
-      if (id != null) {
-        const why = this.#extractBriefReason(text);
-        this.#broadcast('decision_log', {actionId: id, text: String(text||'').slice(0,120)});
-        this.#broadcast('decision_explain', {mode: modeUse, temp, turn: this.#lastSnapshot?.turn, steps: this.#turn.steps, situation, why});
-      }
+  #buildObservation(snapshot: any) {
+    try {
+      const W = Number(snapshot?.board?.width ?? snapshot?.board?.W ?? snapshot?.W ?? 9);
+      const orient = (this.#cfg.orientationOverride && this.#cfg.orientationOverride !== 'auto') ? (this.#cfg.orientationOverride as ('as_is'|'flipped')) : this.#orientation;
+      const youRaw = orient === 'as_is' ? (snapshot?.self || {}) : (snapshot?.enemy || {});
+      const enemyRaw = orient === 'as_is' ? (snapshot?.enemy || {}) : (snapshot?.self || {});
+      const toRC = (idx: any) => {
+        try { const n = Number(idx); if (!Number.isFinite(n)) return undefined; return {row: Math.floor(n / W), col: n % W}; } catch { return undefined; }
+      };
+      const fmtRC = (rc: any) => rc && Number.isFinite(rc.row) && Number.isFinite(rc.col) ? `r${rc.row}c${rc.col}` : undefined;
+
+      // Derive placeable cells per card from latest available_actions
+      const placesByCard: Record<number, Array<{cell_index:number; row:number; col:number; pos:string}>> = {};
+      try {
+        const acts = Array.isArray(this.#lastActions) ? this.#lastActions : [];
+        for (const a of acts) {
+          if (a?.play_card && Number.isFinite(Number(a.play_card.card_id)) && Number.isFinite(Number(a.play_card.cell_index))) {
+            const cid = Number(a.play_card.card_id);
+            const ci = Number(a.play_card.cell_index);
+            const rc = toRC(ci);
+            if (rc) {
+              (placesByCard[cid] ||= []).push({cell_index: ci, row: rc.row, col: rc.col, pos: fmtRC(rc)!});
+            }
+          }
+        }
+      } catch {}
+
+      const normUnit = (u: any, owner: 'self'|'enemy') => u ? ({
+        unit_id: (u.unit_id ?? u.id),
+        card_id: (u.card_id ?? null),
+        name: u.name,
+        hp: u.hp,
+        atk: u.atk,
+        cell_index: u.cell_index,
+        row: toRC(u.cell_index)?.row,
+        col: toRC(u.cell_index)?.col,
+        pos: fmtRC(toRC(u.cell_index)),
+        can_attack: u.can_attack,
+        skills: Array.isArray(u.skills) ? u.skills : undefined,
+      }) : u;
+      const hand = Array.isArray(youRaw.hand) ? youRaw.hand.map((c: any) => ({
+        card_id: (c.card_id ?? c.id),
+        zone: 'hand',
+        kind: 'card',
+        name: c.name,
+        mana_cost: c.mana_cost ?? c.cost,
+        type: c.type,
+        placeable: (() => {
+          const cid = Number(c?.card_id ?? c?.id);
+          const arr = Number.isFinite(cid) ? (placesByCard[cid] || []) : [];
+          return arr;
+        })(),
+      })) : [];
+      const srcSelfUnits = orient === 'as_is' ? (snapshot?.self_units || []) : (snapshot?.enemy_units || []);
+      const srcEnemyUnits = orient === 'as_is' ? (snapshot?.enemy_units || []) : (snapshot?.self_units || []);
+      const selfUnits = Array.isArray(srcSelfUnits) ? srcSelfUnits.map((u: any) => normUnit(u, 'self')) : [];
+      const enemyUnits = Array.isArray(srcEnemyUnits) ? srcEnemyUnits.map((u: any) => normUnit(u, 'enemy')) : [];
+      return {
+        turn: snapshot?.turn,
+        board: { width: W },
+        you: { mana: (youRaw.mana ?? youRaw.energy), hero_hp: (youRaw.health ?? youRaw.hp), hand },
+        opponent: { hero_hp: (enemyRaw.health ?? enemyRaw.hp) },
+        self_units: selfUnits,
+        enemy_units: enemyUnits,
+      };
+    } catch { return { turn: snapshot?.turn }; }
+  }
+
+  #buildIntentUserMessage(observation: any) {
+    try {
+      const obs = JSON.stringify(observation, null, 0);
+      const hint = '规则提示: play_card.card_id 必须来自 you.hand；当出牌时，to 只能从对应手牌的 placeable 列表中选择 (支持 {row,col} / "rXcY" / cell_index)。unit_attack.attacker_unit_id 必须来自 self_units.unit_id；target_unit_id 必须来自 enemy_units.unit_id。不要将场上单位的 card_id 误当作手牌。';
+      return `战局观测（JSON）：\n${obs}\n\n${hint}\n\n请输出严格 JSON 意图（不含多余文本）。`;
+    } catch {
+      return '请输出严格 JSON 意图';
     }
-    return id;
+  }
+
+  #parseIntentObject(text: string | null): any {
+    if (!text) return null;
+    if (typeof text !== 'string') return null as any;
+    const t = text.trim();
+    const tryParse = (s: string) => { try { return JSON.parse(s); } catch { return null; } };
+    let obj = tryParse(t);
+    if (!obj) {
+      const i = t.indexOf('{'); const j = t.lastIndexOf('}');
+      if (i >= 0 && j >= i) obj = tryParse(t.slice(i, j + 1));
+    }
+    if (!obj || typeof obj !== 'object') return null;
+    return obj;
+  }
+
+  #compileIntentToActionId(intent: any, actions: any[], snapshot: any): {id: number|null; error?: string} {
+    try {
+      if (!intent || typeof intent !== 'object') return {id: null, error: 'no intent'};
+      const action = (intent as any).action;
+      if (!action || typeof action !== 'object') return {id: null, error: 'no action field'};
+      const type = String((action as any).type || '').toLowerCase();
+      const by = (pred: (a:any)=>boolean) => actions.find(pred)?.id ?? null;
+      const W = Number(snapshot?.board?.width ?? snapshot?.board?.W ?? snapshot?.W ?? 9);
+      const toCellFromRC = (rc: any) => {
+        try { const r = Number(rc?.row), c = Number(rc?.col); if (!Number.isFinite(r) || !Number.isFinite(c)) return null; return (r * W) + c; } catch { return null; }
+      };
+      const parseRxc = (s: any) => {
+        try { const t = String(s||''); const m = /^r(\d+)c(\d+)$/i.exec(t); if (!m) return null; return {row: Number(m[1]), col: Number(m[2])}; } catch { return null; }
+      };
+      const resolveTargetCell = (obj: any, keys: {cell?: string; to?: string; target?: string}) => {
+        // Accept forms: {cell_index}, {to_cell_index}, {to:{row,col}|"rXcY"|{cell_index}}, {target:{row,col}|"rXcY"|{cell_index}}
+        if (!obj || typeof obj !== 'object') return null;
+        const cellK = keys.cell || 'cell_index';
+        const toCellK = keys.to || 'to_cell_index';
+        const targetK = keys.target || 'target';
+        if (obj[cellK] != null) { const n = Number(obj[cellK]); return Number.isFinite(n) ? n : null; }
+        if (obj[toCellK] != null) { const n = Number(obj[toCellK]); return Number.isFinite(n) ? n : null; }
+        const fromTo = obj.to != null ? obj.to : null;
+        const fromTarget = obj[targetK] != null ? obj[targetK] : null;
+        const candidate = fromTo != null ? fromTo : fromTarget;
+        if (candidate == null) return null;
+        if (typeof candidate === 'string') { const rc = parseRxc(candidate); return rc ? toCellFromRC(rc) : null; }
+        if (typeof candidate === 'object') {
+          if ((candidate as any).cell_index != null) { const n = Number((candidate as any).cell_index); return Number.isFinite(n) ? n : null; }
+          const rc = parseRxc((candidate as any).pos) || {row: (candidate as any).row, col: (candidate as any).col};
+          return toCellFromRC(rc);
+        }
+        return null;
+      };
+      switch (type) {
+        case 'play_card': {
+          const cid = Number((action as any).card_id);
+          let cell = Number((action as any).to_cell_index ?? (action as any).cell_index);
+          if (!Number.isFinite(cell)) cell = resolveTargetCell(action, {cell: 'cell_index', to: 'to_cell_index', target: 'target'}) ?? NaN;
+          if (Number.isFinite(cid) && Number.isFinite(cell)) {
+            const m = by(a => a?.play_card && a.play_card.card_id === cid && a.play_card.cell_index === cell);
+            if (m != null) return {id: m};
+            return {id: null, error: 'play_card not available at target cell'};
+          }
+          return {id: null, error: 'play_card missing card_id/cell'};
+        }
+        case 'move': {
+          const uid = Number((action as any).unit_id);
+          let cell = Number((action as any).to_cell_index);
+          if (!Number.isFinite(cell)) cell = resolveTargetCell(action, {to: 'to_cell_index'}) ?? NaN;
+          if (Number.isFinite(uid) && Number.isFinite(cell)) {
+            const m = by(a => a?.move_unit && a.move_unit.unit_id === uid && a.move_unit.to_cell_index === cell);
+            if (m != null) return {id: m};
+          }
+          return {id: null, error: 'move not available'};
+        }
+        case 'unit_attack': {
+          const att = Number((action as any).attacker_unit_id);
+          const tgt = Number((action as any).target_unit_id);
+          if (Number.isFinite(att) && Number.isFinite(tgt)) {
+            const m = by(a => a?.unit_attack && a.unit_attack.attacker_unit_id === att && a.unit_attack.target_unit_id === tgt);
+            if (m != null) return {id: m};
+          }
+          return {id: null, error: 'unit_attack not available'};
+        }
+        case 'hero_power': {
+          if ((action as any).cell_index != null || (action as any).to_cell_index != null || (action as any).target != null || (action as any).to != null) {
+            const cell = resolveTargetCell(action, {cell: 'cell_index', to: 'to_cell_index', target: 'target'});
+            const m = by(a => a?.hero_power && a.hero_power.cell_index === cell);
+            if (m != null) return {id: m};
+          }
+          const any = by(a => a?.hero_power);
+          if (any != null) return {id: any};
+          return {id: null, error: 'hero_power not available'};
+        }
+        case 'end_turn': {
+          const m = by(a => a?.end_turn);
+          if (m != null) return {id: m};
+          return {id: null, error: 'end_turn not available'};
+        }
+        default:
+          return {id: null, error: `unknown type: ${type}`};
+      }
+    } catch (e:any) { return {id: null, error: String(e?.message||e)}; }
   }
 
   #pruneActions(actions: any[], maxActions: number) {
@@ -600,6 +774,41 @@ export class AgentModule implements AppModule {
       }
       return sum;
     } catch { return null; }
+  }
+
+  #summarizeActionsVerbose(actions: any[]) {
+    try {
+      const cardNames = new Set<string>();
+      const units = new Set<string>();
+      const byType: Record<string, any[]> = {play: [], attack: [], move: [], skill: [], power: [], end: []};
+      
+      for (const a of (actions||[])) {
+        if (a?.end_turn) byType.end.push(a);
+        else if (a?.play_card) {
+          byType.play.push(a);
+          if (a.card_name) cardNames.add(a.card_name);
+        }
+        else if (a?.unit_attack) {
+          byType.attack.push(a);
+          if (a.unit_attack?.attacker?.name) units.add(a.unit_attack.attacker.name);
+        }
+        else if (a?.move_unit) {
+          byType.move.push(a);
+        }
+        else if (a?.use_skill) byType.skill.push(a);
+        else if (a?.hero_power) byType.power.push(a);
+      }
+      
+      const summary = [];
+      if (byType.play.length) summary.push(`play_card(${Array.from(cardNames).join(',')})x${byType.play.length}`);
+      if (byType.attack.length) summary.push(`unit_attackx${byType.attack.length}`);
+      if (byType.move.length) summary.push(`move_unitx${byType.move.length}`);
+      if (byType.skill.length) summary.push(`use_skillx${byType.skill.length}`);
+      if (byType.power.length) summary.push(`hero_powerx${byType.power.length}`);
+      if (byType.end.length) summary.push(`end_turnx${byType.end.length}`);
+      
+      return summary.join(', ') || 'no actions';
+    } catch { return 'parse error'; }
   }
 
   // --- Advanced decision helpers ---
@@ -753,8 +962,6 @@ export class AgentModule implements AppModule {
             ],
             temperature: t,
             max_tokens: this.#cfg.maxTokens || 256,
-            tools: (this.#cfg.decisionMode === 'tool_call') ? this.#buildToolFunctions(actions) : undefined,
-            tool_choice: (this.#cfg.decisionMode === 'tool_call') ? 'auto' as const : undefined,
           },
         });
       }
@@ -829,13 +1036,13 @@ export class AgentModule implements AppModule {
       (s as any).advantage = adv;
       (s as any).profilePrefer = adv > 0.6 ? 'aggressive' : (adv < 0.4 ? 'defensive' : 'balanced');
       const nActs = Array.isArray(actions) ? actions.length : 0;
-      (s as any).modePrefer = nActs > 18 ? 'tool_call' : (nActs > 8 ? 'rank_then_choose' : 'json_strict');
+      (s as any).modePrefer = 'intent';
       return s;
     } catch { return {advantage: 0.5, profilePrefer: 'balanced', modePrefer: null}; }
   }
 
-  #chooseMode(current: 'json_strict'|'tool_call'|'rank_then_choose'|'policy_only'|undefined, situation: any) {
-    try { if (current === 'policy_only') return current; return situation?.modePrefer || current || 'json_strict'; } catch { return current || 'json_strict'; }
+  #chooseMode(current: 'intent'|'policy_only'|undefined, situation: any) {
+    try { return current || 'intent'; } catch { return 'intent'; }
   }
 
   #extractBriefReason(text: string | null) {
@@ -989,6 +1196,31 @@ export class AgentModule implements AppModule {
     try { return this.#clamp(val, this.#cfg.minTemp ?? 0.1, this.#cfg.maxTemp ?? 0.7); } catch { return val; }
   }
   #clamp(x: number, lo: number, hi: number) { return Math.max(lo, Math.min(hi, x)); }
+
+  #updateOrientation(actions: any[]) {
+    const override = this.#cfg.orientationOverride || 'auto';
+    if (override === 'as_is') { this.#orientation = 'as_is'; return; }
+    if (override === 'flipped') { this.#orientation = 'flipped'; return; }
+    try {
+      const snap = this.#lastSnapshot;
+      if (!snap) return;
+      const idsSelf = new Set<number>((Array.isArray(snap.self_units) ? snap.self_units : []).map((u: any) => Number(u?.unit_id ?? u?.id)).filter(Number.isFinite));
+      const idsEnemy = new Set<number>((Array.isArray(snap.enemy_units) ? snap.enemy_units : []).map((u: any) => Number(u?.unit_id ?? u?.id)).filter(Number.isFinite));
+      let cntSelf = 0, cntEnemy = 0;
+      for (const a of actions || []) {
+        const uid = a?.unit_attack?.attacker_unit_id ?? a?.move_unit?.unit_id ?? a?.use_skill?.unit_id;
+        const n = Number(uid);
+        if (!Number.isFinite(n)) continue;
+        if (idsSelf.has(n)) cntSelf++;
+        if (idsEnemy.has(n)) cntEnemy++;
+      }
+      const decided: 'as_is'|'flipped' = cntEnemy > cntSelf ? 'flipped' : 'as_is';
+      if (this.#orientation !== decided) {
+        this.#orientation = decided;
+        try { console.log('[agent] orientation detected', {decided, cntSelf, cntEnemy}); } catch {}
+      }
+    } catch {}
+  }
 }
 
 export function createAgentModule(...args: ConstructorParameters<typeof AgentModule>) {
