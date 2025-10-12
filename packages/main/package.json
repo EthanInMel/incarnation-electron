@@ -15,7 +15,8 @@
     "@app/preload": "*",
     "@app/renderer": "*",
     "electron-updater": "6.6.2",
-    "axios": "^1.7.9"
+    "axios": "^1.7.9",
+    "sqlite-electron": "^1.0.0"
   },
   "devDependencies": {
     "@app/electron-versions": "*",

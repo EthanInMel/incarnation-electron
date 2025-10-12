@@ -8,6 +8,8 @@ const Agent = lazy(() => import('./pages/Agent'))
 const Logs = lazy(() => import('./pages/Logs'))
 const Presets = lazy(() => import('./pages/Presets'))
 const Settings = lazy(() => import('./settings/Settings'))
+const LLMHistory = lazy(() => import('./pages/LLMHistory'))
+const Sessions = lazy(() => import('./pages/Sessions'))
 
 const rootRoute = createRootRoute({
   component: () => (
@@ -67,12 +69,34 @@ const presetsRoute = createRoute({
   ),
 })
 
+const llmHistoryRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/llm',
+  component: () => (
+    <Suspense fallback={<div className="p-4">Loading...</div>}>
+      <LLMHistory />
+    </Suspense>
+  ),
+})
+
+const sessionsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/sessions',
+  component: () => (
+    <Suspense fallback={<div className="p-4">Loading...</div>}>
+      <Sessions />
+    </Suspense>
+  ),
+})
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   agentRoute,
   logsRoute,
   presetsRoute,
   settingsRoute,
+  llmHistoryRoute,
+  sessionsRoute,
 ])
 
 export const router = createRouter({

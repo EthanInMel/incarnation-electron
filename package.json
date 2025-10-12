@@ -27,6 +27,7 @@
     "init": "npm run create-renderer && npm run integrate-renderer && npm install"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.0.1",
     "@npmcli/map-workspaces": "5.0.0",
     "@playwright/test": "1.55.0",
     "@types/node": "24.3.1",
