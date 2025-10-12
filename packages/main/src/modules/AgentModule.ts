@@ -121,9 +121,9 @@ export class AgentModule implements AppModule {
 
   async enable({app}: ModuleContext): Promise<void> {
     await app.whenReady();
-    this.#configPath = join(app.getPath('userData'), 'companion-config.json');
+    this.#configPath = join(app.getPath('userData'), 'companion-config.json'); // legacy path (kept for migration)
     this.#strategyPath = join(app.getPath('userData'), 'companion-strategy.json');
-    this.#loadConfigFromDisk();
+    this.#loadConfigFromDBOrDisk();
     this.#loadStrategyFromDisk();
 
     this.#initIpc();
@@ -232,12 +232,39 @@ export class AgentModule implements AppModule {
 
   // config path resolved in enable()
 
-  #loadConfigFromDisk() {
+  #loadConfigFromDBOrDisk() {
     try {
+      // 1) Try DB first
+      try {
+        const currentProv = this.#db.getCurrentProvider() || this.#cfg.provider || 'openai'
+        const cfgFromDb = this.#db.loadConfig(currentProv)
+        if (cfgFromDb && typeof cfgFromDb === 'object') {
+          this.#cfg = {...this.#cfg, ...cfgFromDb}
+          this.#cfg.provider = currentProv
+          return
+        }
+      } catch {}
+
+      // 2) Fallback legacy file
       if (existsSync(this.#configPath)) {
         const raw = readFileSync(this.#configPath, 'utf8');
         const parsed = JSON.parse(raw);
-        this.#updateConfig(parsed);
+        // Support both legacy single-config and new multi-provider blob
+        if (parsed && typeof parsed === 'object' && (parsed.provider || parsed.model || parsed.baseUrl)) {
+          // legacy: direct config
+          this.#updateConfig(parsed);
+        } else if (parsed && typeof parsed === 'object') {
+          const currentProvFromFile = typeof parsed.__currentProvider === 'string' ? parsed.__currentProvider : null
+          const currentProv = currentProvFromFile || String(this.#cfg?.provider || 'openai')
+          // Always honor selection first
+          this.#cfg.provider = currentProv
+          const bucket = parsed[currentProv]
+          if (bucket && typeof bucket === 'object') {
+            this.#updateConfig(bucket)
+          } else {
+            // no bucket, keep existing cfg fields; do not fallback to other providers to avoid overriding selection
+          }
+        }
       }
     } catch {}
   }
@@ -254,11 +281,13 @@ export class AgentModule implements AppModule {
 
   #saveConfigToDisk(): string | null {
     try {
-      writeFileSync(this.#configPath, JSON.stringify(this.#cfg, null, 2), 'utf8');
-      console.log('[agent] cfg written to disk', {path: this.#configPath})
-      return this.#configPath;
+      // Save into DB (authoritative); do not mirror JSON anymore
+      const prov = String(this.#cfg.provider||'default')
+      try { this.#db.saveConfig(prov, this.#cfg); this.#db.setCurrentProvider(prov) } catch {}
+      console.log('[agent] cfg saved to DB')
+      return null
     } catch {
-      console.warn('[agent] failed to write cfg to disk', {path: this.#configPath})
+      console.warn('[agent] failed to save cfg to DB')
       return null;
     }
   }
@@ -270,6 +299,19 @@ export class AgentModule implements AppModule {
   }
 
   #updateConfig(partial: Partial<AgentConfig>) {
+    // If provider changed, try to load its last-saved bucket
+    const incomingProvider = String((partial as any)?.provider || this.#cfg.provider || 'openai')
+    if (incomingProvider && incomingProvider !== this.#cfg.provider) {
+      try {
+        if (existsSync(this.#configPath)) {
+          const blob = JSON.parse(readFileSync(this.#configPath, 'utf8'))
+          const saved = blob && blob[incomingProvider]
+          if (saved && typeof saved === 'object') {
+            this.#cfg = {...this.#cfg, ...saved}
+          }
+        }
+      } catch {}
+    }
     this.#cfg = {...this.#cfg, ...partial, knowledge: {...(this.#cfg.knowledge||{}), ...(partial.knowledge||{})}};
     this.#paused = !!(((partial as any)||{}).paused ?? ((this.#cfg as any)||{}).paused);
   }
@@ -1194,6 +1236,8 @@ export class AgentModule implements AppModule {
         tool_choice: tools && tools.length ? 'auto' : undefined,
         temperature: this.#clampTemp(temp ?? (this.#cfg.temperature ?? 0.15)),
         max_tokens: Math.max(256, this.#cfg.maxTokens || 384),
+        // Provider specific compatibility
+        ...(String(this.#cfg.provider||'').toLowerCase()==='siliconflow' ? {enable_thinking: false} : {}),
       } as any;
       const t0 = Date.now()
       const res = await callDispatcher(this.#cfg, payload);
@@ -2002,11 +2046,16 @@ export class AgentModule implements AppModule {
       const { translateIntentPlan } = await import('./agent/intent-translator.js');
       const { buildIntentPrompt } = await import('./agent/prompts.js');
 
-      // Build simplified observation (no detailed coordinates)
-      const obs = this.#buildIntentObservation(snapshot);
+      // Build augmented snapshot for prompt: include available_actions and tactical_preview
+      const prunedForPrompt = this.#pruneActions(actions, this.#cfg.maxActions || 24)
+      const augSnapshot = {
+        ...(snapshot||{}),
+        available_actions: prunedForPrompt,
+        tactical_preview: this.#lastTacticalPreview || (snapshot && (snapshot as any).tactical_preview) || [],
+      }
 
-      // Call LLM for intent
-      const prompt = buildIntentPrompt(obs);
+      // Call LLM for intent (the prompt builder will extract compact fields)
+      const prompt = buildIntentPrompt(augSnapshot, {model: this.#cfg.model, temperature: this.#cfg.temperature, maxTokens: this.#cfg.maxTokens});
       const t0 = Date.now()
       const res = await callDispatcher(this.#cfg, prompt);
       try {
@@ -2030,22 +2079,35 @@ export class AgentModule implements AppModule {
         console.log(`${cyan}[LLM][intent_driven] response:${reset}`, text);
       } catch {}
 
-      // Parse intent JSON
-      let intentPlan: any = null;
-      try {
-        intentPlan = parseIntentObject(text);
-      } catch {
+      // Parse intent JSON (supports two shapes):
+      // A) { steps: Intent[] }
+      // B) { turn_plan: { steps: ConcreteStep[] } }
+      let intentObj: any = null;
+      try { intentObj = parseIntentObject(text); } catch {}
+      if (!intentObj || typeof intentObj !== 'object') {
         console.warn('[agent] Failed to parse intent JSON');
         return { mode: 'intent_driven', actionId: null, reason: 'parse_error' };
       }
 
-      if (!intentPlan || !Array.isArray(intentPlan.steps)) {
-        console.warn('[agent] Invalid intent plan structure');
+      // If model produced concrete turn_plan directly, submit it
+      if (intentObj.turn_plan && Array.isArray(intentObj.turn_plan.steps)) {
+        const handled = this.#tryHandleTurnPlan(intentObj, snapshot, actions);
+        if (handled) {
+          this.#broadcast('decision_log', {plan: intentObj.turn_plan, info: 'turn_plan submitted (intent_driven)'});
+          return null;
+        }
+        // fallthrough: if handler refused, treat as invalid
+        console.warn('[agent] Provided turn_plan could not be handled');
+        return { mode: 'intent_driven', actionId: null, reason: 'invalid_turn_plan' };
+      }
+
+      if (!Array.isArray(intentObj.steps)) {
+        console.warn('[agent] Invalid intent plan structure (expect steps[] or turn_plan.steps[])');
         return { mode: 'intent_driven', actionId: null, reason: 'invalid_structure' };
       }
 
-      // Translate intents to concrete turn_plan
-      const turnPlan = translateIntentPlan(intentPlan, snapshot, actions);
+      // Translate high-level intents to executable turn_plan
+      const turnPlan = translateIntentPlan(intentObj, snapshot, actions);
 
       if (!turnPlan.steps || turnPlan.steps.length === 0) {
         console.warn('[agent] Intent translation produced no steps');
@@ -2066,14 +2128,12 @@ export class AgentModule implements AppModule {
 
         const green = '\x1b[32m', reset = '\x1b[0m';
         console.log(`${green}[agent] Intent-driven plan submitted:${reset}`, {
-          analysis: intentPlan.analysis,
           steps: turnPlan.steps.length
         });
 
         this.#broadcast('decision_log', {
           mode: 'intent_driven',
           plan: payload,
-          analysis: intentPlan.analysis,
           info: 'turn_plan submitted'
         });
 
@@ -2082,7 +2142,7 @@ export class AgentModule implements AppModule {
           actionId: null,
           reason: 'intent_plan_submitted',
           deferExecution: true,
-          metadata: { intentPlan, turnPlan }
+          metadata: { turnPlan }
         };
       } catch (e) {
         console.error('[agent] Failed to send intent plan:', e);

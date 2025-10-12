@@ -9,6 +9,35 @@ function getDefaultBaseUrl(provider: string): string {
 }
 
 export async function callDispatcher(cfg: AgentConfig, payload: any) {
+  const prov = String(cfg.provider||'').toLowerCase()
+  // Dispatcher mode: treat baseUrl as dispatcher host and call /dispatch
+  if (prov === 'dispatcher') {
+    const endpoint = '/dispatch'
+    const baseURL = cfg.baseUrl && cfg.baseUrl.trim().length > 0 ? cfg.baseUrl : 'http://localhost:3000'
+    let attempt = 0; let lastErr: any = null
+    while (attempt < 2) {
+      try {
+        const timeout = Math.max(5000, Math.min(60000, Number((cfg as any).policyTimeoutMs || cfg.maxTurnMs || 15000)));
+        const headers: Record<string, string> = { 'Content-Type': 'application/json; charset=utf-8' };
+        if ((cfg as any).apiKey) headers.Authorization = `Bearer ${(cfg as any).apiKey}`;
+        const client = axios.create({ baseURL, timeout, headers });
+        const upstream = cfg.upstreamProvider || 'siliconflow'
+        const body = {
+          provider: upstream,
+          model: cfg.model,
+          endpoint: cfg.endpoint || 'chat/completions',
+          payload,
+          source: 'electron-agent'
+        }
+        return await client.post(endpoint, body)
+      } catch (e) {
+        lastErr = e; await new Promise(r=> setTimeout(r, 500*(attempt+1))); attempt++
+      }
+    }
+    if (lastErr) throw lastErr
+    throw new Error('dispatcher failed')
+  }
+
   // Direct call to provider (OpenAI or SiliconFlow)
   const endpoint = `/${String(cfg.endpoint || 'chat/completions').replace(/^\/+/, '')}`;
   const baseURL = cfg.baseUrl && cfg.baseUrl.trim().length > 0 ? cfg.baseUrl : getDefaultBaseUrl(cfg.provider);
@@ -23,10 +52,14 @@ export async function callDispatcher(cfg: AgentConfig, payload: any) {
 
       const client = axios.create({ baseURL, timeout, headers });
       // Ensure model and safety defaults
-      const body = { ...payload };
+      const body = { ...payload } as any;
       body.model = cfg.model || body.model;
       if (typeof body.temperature !== 'number' && typeof cfg.temperature === 'number') body.temperature = cfg.temperature;
       if (typeof body.max_tokens !== 'number' && typeof cfg.maxTokens === 'number') body.max_tokens = cfg.maxTokens;
+      // SiliconFlow requires enable_thinking=false for function/tool calls; keep compatible defaults
+      if (String(cfg.provider||'').toLowerCase()==='siliconflow' && body.tools) {
+        if (typeof body.enable_thinking === 'undefined') body.enable_thinking = false
+      }
 
       return await client.post(endpoint, body);
     } catch (e) {
@@ -36,8 +69,8 @@ export async function callDispatcher(cfg: AgentConfig, payload: any) {
     }
   }
   // Normalize error
-  const provider = String(cfg.provider || '').toLowerCase();
-  const hint = provider === 'siliconflow'
+  const providerName = String(cfg.provider || '').toLowerCase();
+  const hint = providerName === 'siliconflow'
     ? 'SiliconFlow 调用失败，请检查 API Key 与模型是否正确。文档: https://docs.siliconflow.cn/cn/api-reference/'
     : 'OpenAI 调用失败，请检查 API Key 与模型是否正确。';
   if (lastErr) {
@@ -231,13 +264,20 @@ export function parseIntentObject(text: string | null): any {
 
 export function extractText(data: any): string | null {
   try {
-    const d = data && data.data;
-    const c = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
-    if (typeof c === 'string') return c;
-    const tool = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.tool_calls && d.choices[0].message.tool_calls[0];
-    if (tool && tool.function && typeof tool.function.arguments === 'string') return tool.function.arguments;
-    if (typeof d === 'string') return d;
-    return JSON.stringify(d);
+    // Support both OpenAI-like root object and nested {data: {...}}
+    const root = data && (data.data || data);
+    const choices = root && root.choices;
+    if (Array.isArray(choices) && choices.length > 0) {
+      const msg = choices[0]?.message;
+      const delta = choices[0]?.delta;
+      if (msg?.content && typeof msg.content === 'string') return msg.content;
+      const tool = msg?.tool_calls?.[0];
+      if (tool?.function && typeof tool.function.arguments === 'string') return tool.function.arguments;
+      if (delta?.content && typeof delta.content === 'string') return delta.content;
+    }
+    if (typeof root === 'string') return root;
+    if (root && typeof root === 'object') return JSON.stringify(root);
+    return null;
   } catch { return null; }
 }
 

@@ -95,6 +95,7 @@ export default function Settings() {
   function defaultBaseUrl(provider: string) {
     const p = String(provider||'').toLowerCase()
     if (p === 'siliconflow') return 'https://api.siliconflow.cn/v1'
+    if (p === 'dispatcher') return 'http://localhost:3000'
     return 'https://api.openai.com/v1'
   }
 
@@ -207,6 +208,7 @@ export default function Settings() {
                   <Select.Content>
                     <Select.Item value="openai">OpenAI</Select.Item>
                     <Select.Item value="siliconflow">SiliconFlow</Select.Item>
+                    <Select.Item value="dispatcher">Dispatcher</Select.Item>
                   </Select.Content>
                 </Select.Root>
               </Flex>

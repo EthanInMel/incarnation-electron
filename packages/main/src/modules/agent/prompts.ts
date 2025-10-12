@@ -25,7 +25,20 @@ export const INTENT_SYSTEM_PROMPT = `你是策略卡牌战棋游戏的 AI，目�
 - 返回：{"turn_plan":{"atomic":false,"auto_end":true,"steps":[ ... ]},"rationale":"<=30字简要理由"}
 - 若能 move→attack，请在同一 turn_plan 中顺序输出 move→unit_attack；若 combos 提供 id_move/id_attack 字段，请一并包含在 step 中（便于直接执行）。
 
-✅ 严格输出 JSON（不含任何多余文本）。`;
+✅ 严格输出 JSON（不含任何多余文本）。
+
+输出格式（二选一，优先 A）：
+A) 直接输出可执行计划：
+{
+  "turn_plan": { "atomic": false, "auto_end": true, "steps": [ {"type":"play_card"|"move"|"unit_attack"|"end_turn", ...} ] },
+  "rationale": "简要理由"
+}
+
+B) 仅输出高层意图（系统会翻译为具体动作）：
+{
+  "steps": [ {"type":"advance_and_attack"|"defensive_play"|"aggressive_play"|"direct_attack"|"reposition"|"end_turn", ...} ]
+}
+`;
 
 export const buildIntentObservation = (snapshot: any) => {
   try {
@@ -85,16 +98,16 @@ export const buildIntentObservation = (snapshot: any) => {
   }
 };
 
-export const buildIntentPrompt = (snapshot: any) => {
+export const buildIntentPrompt = (snapshot: any, cfg?: {model?: string; temperature?: number; maxTokens?: number}) => {
   const obs = buildIntentObservation(snapshot);
   return {
-    model: 'gpt-4o-mini',
+    model: cfg?.model,
     messages: [
       { role: 'system', content: INTENT_SYSTEM_PROMPT },
       { role: 'user', content: `当前游戏状态：\n${JSON.stringify(obs, null, 2)}\n\n请基于上述“规则”和“可用动作/预览”返回严格 JSON 的 turn_plan。` }
     ],
-    temperature: 0.2,
-    max_tokens: 512
+    temperature: typeof cfg?.temperature === 'number' ? cfg!.temperature : 0.2,
+    max_tokens: typeof cfg?.maxTokens === 'number' ? cfg!.maxTokens : 512
   };
 };
 
