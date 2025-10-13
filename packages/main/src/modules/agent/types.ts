@@ -2,6 +2,7 @@ export type AgentConfig = {
   provider: string;
   model: string;
   baseUrl: string;
+  upstreamProvider?: string;
   bridgeToken?: string;
   temperature?: number;
   maxTokens?: number;

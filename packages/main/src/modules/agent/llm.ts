@@ -82,6 +82,30 @@ export async function callDispatcher(cfg: AgentConfig, payload: any) {
 }
 
 export function buildPolicyPrompt(observation:any, snapshot:any, cfg: AgentConfig, clampTemp:(v:number)=>number) {
+  // Optional feedback block based on last plan execution
+  let feedbackBlock = ''
+  try {
+    const g: any = (globalThis as any)
+    const fb: any = g.__agent_last_feedback
+    if (fb) {
+      const failedSteps = Array.isArray(fb.steps) ? fb.steps.filter((s:any)=>!s?.ok) : []
+      const failedIds = Array.isArray(fb.failed) ? fb.failed : []
+      if ((failedSteps && failedSteps.length) || (failedIds && failedIds.length)) {
+        const reasonLines: string[] = []
+        try {
+          for (const s of (failedSteps||[])) {
+            const id = s?.id
+            const rsn = s?.reason
+            const desc = s?.desc
+            reasonLines.push(`- id=${id} ${desc?`(${desc})`:''} reason=${rsn||'unknown'}`.trim())
+          }
+        } catch {}
+        if (Array.isArray(failedIds) && failedIds.length) reasonLines.push(`- failed ids: ${failedIds.join(', ')}`)
+        feedbackBlock = ['','⚠️ 上回合失败动作（避免重复）：', ...reasonLines].join('\n')
+      }
+    }
+  } catch {}
+
   const rules = [
     '🎯 CRITICAL: Return ONLY valid JSON in this EXACT format:',
     '{ "analysis": "brief situation summary", "steps": [Step1, Step2, ...] }',
@@ -169,7 +193,7 @@ export function buildPolicyPrompt(observation:any, snapshot:any, cfg: AgentConfi
       '🎯 Use these! Add move step for the unit, then attack step for the target!',
       '   Example: { "type": "move", "unit": "Tryx#1", "hint": "forward" }, { "type": "attack", "attacker": "Tryx#1", "target": "Cinda#1" }',
     ] : []),
-  ].join('\n');
+  ].join('\n') + feedbackBlock;
 
   const systemPrompt = [
     'You are a tactical AI for a HERO-BASED card battler game.',
@@ -187,6 +211,10 @@ export function buildPolicyPrompt(observation:any, snapshot:any, cfg: AgentConfi
     messages: [
       {role:'system', content: systemPrompt},
       {role:'user', content: rules},
+      // Extra hint: provide executable combos to encourage move_then_attack
+      ...(Array.isArray((observation as any)?.move_attack_combos) && (observation as any).move_attack_combos.length > 0 ? [
+        { role: 'user', content: 'Executable move→attack combos (prefer these when generating steps):\n' + JSON.stringify((observation as any).move_attack_combos.slice(0,8)) }
+      ] : []),
     ],
     temperature: clampTemp(cfg.temperature ?? 0.15),
     max_tokens: Math.max(256, cfg.maxTokens || 384),
@@ -196,6 +224,27 @@ export function buildPolicyPrompt(observation:any, snapshot:any, cfg: AgentConfi
 export function buildIntentPrompt(snapshot:any, observation:any, actions:any[], buildActionsForPrompt:(acts:any[])=>any[]) {
   try {
     const parts: string[] = [];
+    // Inject last-turn feedback
+    try {
+      const g: any = (globalThis as any)
+      const fb: any = g.__agent_last_feedback
+      if (fb) {
+        const failedSteps = Array.isArray(fb.steps) ? fb.steps.filter((s:any)=>!s?.ok) : []
+        const failedIds = Array.isArray(fb.failed) ? fb.failed : []
+        if ((failedSteps && failedSteps.length) || (failedIds && failedIds.length)) {
+          parts.push('⚠️ 上回合失败动作（避免重复）：')
+          if (failedSteps && failedSteps.length) {
+            for (const s of failedSteps) {
+              parts.push(`- id=${s?.id} ${s?.desc?`(${s.desc})`:''} reason=${s?.reason||'unknown'}`)
+            }
+          }
+          if (failedIds && failedIds.length) {
+            parts.push(`- failed ids: ${failedIds.join(', ')}`)
+          }
+          parts.push('请不要重复上述失败方案，改用其他可用动作/落点。\n')
+        }
+      }
+    } catch {}
     
     // 统计可用动作类型
     const actionTypes = {

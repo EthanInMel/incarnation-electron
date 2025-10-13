@@ -40,6 +40,22 @@ B) 仅输出高层意图（系统会翻译为具体动作）：
 }
 `;
 
+function buildFeedbackBlock(): string {
+  try {
+    const g: any = (globalThis as any)
+    const fb: any = g.__agent_last_feedback
+    if (!fb) return ''
+    const failedSteps = Array.isArray(fb.steps) ? fb.steps.filter((s:any)=>!s?.ok) : []
+    const failedIds = Array.isArray(fb.failed) ? fb.failed : []
+    if ((!failedSteps || failedSteps.length===0) && (!failedIds || failedIds.length===0)) return ''
+    const lines: string[] = []
+    lines.push('⚠️ 上回合失败动作（避免重复）：')
+    try { for (const s of (failedSteps||[])) { lines.push(`- id=${s?.id} ${s?.desc?`(${s.desc})`:''} reason=${s?.reason||'unknown'}`) } } catch {}
+    if (Array.isArray(failedIds) && failedIds.length) lines.push(`- failed ids: ${failedIds.join(', ')}`)
+    return lines.join('\n')
+  } catch { return '' }
+}
+
 export const buildIntentObservation = (snapshot: any) => {
   try {
     // 简化的观测，只保留战略相关信息
@@ -100,11 +116,12 @@ export const buildIntentObservation = (snapshot: any) => {
 
 export const buildIntentPrompt = (snapshot: any, cfg?: {model?: string; temperature?: number; maxTokens?: number}) => {
   const obs = buildIntentObservation(snapshot);
+  const fb = buildFeedbackBlock();
   return {
     model: cfg?.model,
     messages: [
       { role: 'system', content: INTENT_SYSTEM_PROMPT },
-      { role: 'user', content: `当前游戏状态：\n${JSON.stringify(obs, null, 2)}\n\n请基于上述“规则”和“可用动作/预览”返回严格 JSON 的 turn_plan。` }
+      { role: 'user', content: `${fb? fb + '\n\n' : ''}当前游戏状态：\n${JSON.stringify(obs, null, 2)}\n\n请基于上述“规则”和“可用动作/预览”返回严格 JSON 的 turn_plan。` }
     ],
     temperature: typeof cfg?.temperature === 'number' ? cfg!.temperature : 0.2,
     max_tokens: typeof cfg?.maxTokens === 'number' ? cfg!.maxTokens : 512

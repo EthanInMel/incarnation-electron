@@ -113,6 +113,7 @@ export class AgentModule implements AppModule {
   #pendingPolicyActions: Map<number, PolicyStep> = new Map();
   #chainQueue: Array<{attacker: number; preferredTarget?: number|null; moveId?: number|null; attackId?: number|null; gen?: number; queuedAt?: number; tries?: number}> = [];
   #moveSentThisTurn: Set<string> = new Set();
+  #unitsMovedThisTurn: Set<number> = new Set();
 
   constructor({host = '127.0.0.1', port = 17771}: {host?: string; port?: number} = {}) {
     this.#host = host;
@@ -597,6 +598,20 @@ export class AgentModule implements AppModule {
           this.#batchInflight = null;
           const pr = msg as any;
           this.#broadcast('plan_result', pr);
+          // Cache latest plan feedback for prompt augmentation
+          try {
+            (this as any)._lastPlanFeedback = {
+              turn: Number(pr?.turn),
+              note: pr?.note,
+              steps: Array.isArray(pr?.steps) ? pr.steps.map((s:any)=>({id:s?.id, ok:!!s?.ok, reason:s?.reason||null, desc:s?.desc||this.#findActionDescById(s?.id)})) : []
+            };
+            // also expose to global for prompt builders
+            try {
+              const g: any = (globalThis as any)
+              const prev = g.__agent_last_feedback || {}
+              g.__agent_last_feedback = { ...prev, ...((this as any)._lastPlanFeedback) }
+            } catch {}
+          } catch {}
           try {
             const steps = Array.isArray(pr?.steps) ? pr.steps : [];
             for (let i=0;i<steps.length;i++) {
@@ -611,7 +626,7 @@ export class AgentModule implements AppModule {
           const allFailed = total > 0 && okCnt === 0;
           const aborted = String(pr?.note||'').includes('aborted');
           const myTurn = !!(this.#lastSnapshot && (this.#lastSnapshot as any).is_my_turn === true);
-          if (myTurn && !this.#retriedThisTurn && (aborted || allFailed)) {
+          if (myTurn && !this.#retriedThisTurn && (aborted || allFailed) && !this.#batchInflight) {
             this.#retriedThisTurn = true;
             setTimeout(()=>{ try { this.#stepDecision(this.#lastActions||[], this.#actionsGen).catch(()=>{}); } catch {} }, 120);
           }
@@ -631,6 +646,16 @@ export class AgentModule implements AppModule {
               }
             }
           }
+          // Cache summary for prompt augmentation
+          try {
+            (this as any)._lastBatchSummary = { atomic: !!(msg as any)?.atomic, applied: (msg as any)?.applied || [], failed: (msg as any)?.failed || [], note: (msg as any)?.note }
+            // also expose to global for prompt builders
+            try {
+              const g: any = (globalThis as any)
+              const prev = g.__agent_last_feedback || {}
+              g.__agent_last_feedback = { ...prev, applied: (this as any)._lastBatchSummary.applied, failed: (this as any)._lastBatchSummary.failed, note: (this as any)._lastBatchSummary.note }
+            } catch {}
+          } catch {}
         } catch {}
         break;
       }
@@ -661,6 +686,7 @@ export class AgentModule implements AppModule {
         if (this.#planTimer) { clearTimeout(this.#planTimer); this.#planTimer = null; }
         this.#resetPolicyForNewTurn(t);
         try { this.#moveSentThisTurn.clear(); } catch {}
+        try { this.#unitsMovedThisTurn.clear(); } catch {}
         try { this.#chainQueue = []; } catch {}
         // Clear any previous isMyTurn override on turn change; will be re-evaluated on next available_actions
         try { (this as any)._isMyTurnOverride = undefined } catch {}
@@ -883,12 +909,6 @@ export class AgentModule implements AppModule {
 
   #sendAction(actionId: number) {
     // Accumulate into local turn-plan (hierarchical mode) and coalesce send
-    if (this.#cfg.alwaysCallLLMOnOwnTurn && this.#isMyTurnStrict()) {
-      // Defer local immediate sends; force LLM-driven plan first
-      try { console.log('[agent] alwaysCallLLMOnOwnTurn: deferring direct send, will request LLM plan'); } catch {}
-      try { this.#decideIntentDriven(this.#lastActions||[], this.#lastSnapshot||{}).catch(()=>{}); } catch {}
-      return;
-    }
     const a = (this.#lastActions||[]).find((x:any)=>x&&x.id===actionId);
     const step = toStep(a)
     if (step) this.#turnPlanSteps.push(step)
@@ -941,7 +961,10 @@ export class AgentModule implements AppModule {
       const reqId = randomUUID();
       const steps0 = this.#turnPlanSteps.slice();
       const steps1 = this.#augmentPlanWithMoveThenAttack(steps0, this.#lastSnapshot)
-      const steps = this.#attachUidsToSteps(steps1, this.#lastSnapshot)
+      const steps2 = this.#attachUidsToSteps(steps1, this.#lastSnapshot)
+      const steps3 = this.#normalizeStepsForUnity(steps2)
+      const steps4 = this.#combineMoveAndAttack(steps3)
+      const steps = this.#validateAndFixupAttacks(steps4, this.#lastActions||[], this.#lastSnapshot)
       const payload = { atomic: false, auto_end: false, steps }
       this.#send({type: 'turn_plan', turn_plan: payload, req_id: reqId})
       this.#batchInflight = {reqId, ts: Date.now()}
@@ -997,26 +1020,27 @@ export class AgentModule implements AppModule {
                 if (!hasAtk) { augmented.push(s); continue }
               }
               const cand = (preview as any[]).find((p:any)=> Number(p?.unit_id)===uid && Number(p?.to_cell_index)===toCell)
-              const canNow = attackerIds.has(uid) || canAttackById.has(uid)
-              if (cand && canNow) {
+              if (cand) {
                 const atks = Array.isArray((cand as any).attacks) ? (cand as any).attacks : []
                 let pick: any = null
-                if (atks.length) { pick = this.#pickAttackFromList(atks, want) }
+                if (atks.length) { pick = this.#pickAttackFromList(atks, want) || atks[0] }
                 const tgt = Number.isFinite(Number(pick?.target_unit_id)) ? Number(pick.target_unit_id) : (Number.isFinite(Number((cand as any).target_unit_id)) ? Number((cand as any).target_unit_id) : null)
+                const atkId = Number.isFinite(Number(pick?.id_attack)) ? Number(pick.id_attack) : (Number.isFinite(Number((cand as any).id_attack)) ? Number((cand as any).id_attack) : undefined)
                 if (tgt != null) {
-                  const step = { type: 'move_then_attack', unit_id: uid, to: { cell_index: toCell }, target_unit_id: tgt }
+                  const step: any = { type: 'move_then_attack', unit_id: uid, to: { cell_index: toCell }, target_unit_id: tgt }
+                  if (Number.isFinite(Number(atkId))) step.attack_id = Number(atkId)
                   augmented.push(step)
                   try { (this as any)._metric_mtaQueued = ((this as any)._metric_mtaQueued||0) + 1 } catch {}
-                  try { console.log('[agent] ✳ augment move→move_then_attack', {unit_id: uid, to: toCell, target_unit_id: tgt}) } catch {}
+                  try { console.log('[agent] ✳ augment move→move_then_attack', {unit_id: uid, to: toCell, target_unit_id: tgt, attack_id: atkId}) } catch {}
                   continue
                 }
-              }
-              // Heuristic: if move leads to future attack (by preview entries with any attacks), still include move
-              if (cand && Array.isArray((cand as any).attacks) && (cand as any).attacks.length>0) {
-                const step = { type: 'move', unit_id: uid, to: { cell_index: toCell } }
-                augmented.push(step)
-                try { console.log('[agent] ✳ augment move (future attack potential)', {unit_id: uid, to: toCell}) } catch {}
-                continue
+                // If no explicit target found, at least keep the move (future attack potential)
+                if (Array.isArray((cand as any).attacks) && (cand as any).attacks.length>0) {
+                  const step = { type: 'move', unit_id: uid, to: { cell_index: toCell } }
+                  augmented.push(step)
+                  try { console.log('[agent] ✳ augment move (future attack potential)', {unit_id: uid, to: toCell}) } catch {}
+                  continue
+                }
               }
             }
           }
@@ -1105,6 +1129,172 @@ export class AgentModule implements AppModule {
     } catch { return steps || [] }
   }
 
+  #normalizeStepsForUnity(steps: any[]): any[] {
+    try {
+      if (!Array.isArray(steps)) return steps || []
+      const normalized: any[] = []
+      const movedUnits = new Set<number>()
+      try { for (const u of (this.#unitsMovedThisTurn as any as Set<number>)) { movedUnits.add(u) } } catch {}
+      for (const raw of steps) {
+        try {
+          const s = (raw && typeof raw === 'object') ? { ...raw } : raw
+          const t = String(s?.type || '').toLowerCase()
+          if (t === 'move' || t === 'move_then_attack') {
+            const hasTo = s && typeof s.to === 'object' && s.to != null
+            let ci: any = undefined
+            try { if (hasTo && (s.to as any).cell_index != null) ci = (s.to as any).cell_index } catch {}
+            if (!Number.isFinite(Number(ci))) {
+              if (Number.isFinite(Number(s?.to_cell_index))) ci = Number(s.to_cell_index)
+              else if (Number.isFinite(Number(s?.cell_index))) ci = Number(s.cell_index)
+            }
+            if (Number.isFinite(Number(ci))) {
+              s.to = { cell_index: Number(ci) }
+            }
+            // remove flattened hints to avoid confusion
+            try { delete (s as any).to_cell_index } catch {}
+            try { delete (s as any).cell_index } catch {}
+            // per-turn move dedupe: only first move per unit
+            try {
+              const uid = Number((s as any).unit_id)
+              if (Number.isFinite(uid)) {
+                if (movedUnits.has(uid)) {
+                  // If move_then_attack, drop to attack-only; else skip
+                  if (t === 'move_then_attack') {
+                    const atkOnly: any = { type: 'unit_attack', attacker_unit_id: uid, target_unit_id: Number((s as any).target_unit_id) }
+                    normalized.push(atkOnly)
+                  }
+                  continue
+                }
+                movedUnits.add(uid)
+              }
+            } catch {}
+            normalized.push(s)
+            continue
+          }
+          if (t === 'play_card') {
+            const hasTo = s && typeof s.to === 'object' && s.to != null
+            let ci: any = undefined
+            try { if (hasTo && (s.to as any).cell_index != null) ci = (s.to as any).cell_index } catch {}
+            if (!Number.isFinite(Number(ci))) {
+              if (Number.isFinite(Number(s?.to_cell_index))) ci = Number(s.to_cell_index)
+              else if (Number.isFinite(Number(s?.cell_index))) ci = Number(s.cell_index)
+            }
+            if (Number.isFinite(Number(ci))) {
+              s.to = { cell_index: Number(ci) }
+            }
+            try { delete (s as any).to_cell_index } catch {}
+            try { delete (s as any).cell_index } catch {}
+            normalized.push(s)
+            continue
+          }
+          normalized.push(s)
+        } catch { normalized.push(raw) }
+      }
+      return normalized
+    } catch { return steps || [] }
+  }
+
+  #validateAndFixupAttacks(steps: any[], actions: any[], snapshot: any): any[] {
+    try {
+      if (!Array.isArray(steps)) return steps || []
+      const atkPairs = new Set<string>()
+      try {
+        for (const a of (actions||[])) {
+          if (a && a.unit_attack) {
+            const att = Number(a.unit_attack.attacker_unit_id)
+            const tgt = Number(a.unit_attack.target_unit_id)
+            if (Number.isFinite(att)) atkPairs.add(`${att}->${Number.isFinite(tgt)?tgt:0}`)
+          }
+        }
+      } catch {}
+      const fixed: any[] = []
+      for (const s of steps) {
+        try {
+          const t = String(s?.type||'').toLowerCase()
+          if (t === 'move_then_attack') {
+            const att = Number((s as any).unit_id)
+            const tgt = Number((s as any).target_unit_id)
+            const k = `${att}->${Number.isFinite(tgt)?tgt:0}`
+            if (!atkPairs.has(k)) {
+              // Try to replace target with any current legal target for this attacker
+              let replaced = false
+              try {
+                for (const a of (actions||[])) {
+                  if (a && a.unit_attack && Number(a.unit_attack.attacker_unit_id) === att) {
+                    const newT = Number(a.unit_attack.target_unit_id)
+                    const nk = `${att}->${Number.isFinite(newT)?newT:0}`
+                    if (atkPairs.has(nk)) {
+                      fixed.push({ type:'move_then_attack', unit_id: att, to: (s as any).to, target_unit_id: newT })
+                      replaced = true
+                      break
+                    }
+                  }
+                }
+              } catch {}
+              if (replaced) continue
+              // unknown or OOR; downgrade to move only
+              fixed.push({ type:'move', unit_id: att, to: (s as any).to })
+              continue
+            }
+          }
+          // Track first moves to persist across multiple submissions within same turn
+          if (t === 'move' || t === 'move_then_attack') {
+            try {
+              const uid = Number((s as any).unit_id)
+              if (Number.isFinite(uid)) this.#unitsMovedThisTurn.add(uid)
+            } catch {}
+          }
+          fixed.push(s)
+        } catch { fixed.push(s) }
+      }
+      return fixed
+    } catch { return steps || [] }
+  }
+
+  #combineMoveAndAttack(steps: any[]): any[] {
+    try {
+      if (!Array.isArray(steps) || steps.length === 0) return steps || []
+      const result: any[] = []
+      const consumed = new Set<number>()
+      for (let i = 0; i < steps.length; i++) {
+        if (consumed.has(i)) continue
+        const s: any = steps[i]
+        const t = String(s?.type || '').toLowerCase()
+        if (t === 'move' && Number.isFinite(Number(s?.unit_id))) {
+          const uid = Number(s.unit_id)
+          let pairedIndex: number | null = null
+          let targetId: number | null = null
+          let attackId: number | undefined = undefined
+          let targetUid: string | undefined = undefined
+          // look ahead for first unit_attack by same unit
+          for (let j = i + 1; j < steps.length; j++) {
+            if (consumed.has(j)) continue
+            const sj: any = steps[j]
+            const tj = String(sj?.type || '').toLowerCase()
+            if (tj === 'unit_attack' && Number.isFinite(Number(sj?.attacker_unit_id)) && Number(sj.attacker_unit_id) === uid) {
+              pairedIndex = j
+              targetId = Number(sj.target_unit_id)
+              if (Number.isFinite(Number(sj?.id_attack))) attackId = Number(sj.id_attack)
+              if (typeof sj?.target_uid === 'string') targetUid = sj.target_uid
+              break
+            }
+          }
+          if (pairedIndex != null && targetId != null) {
+            const combined: any = { type: 'move_then_attack', unit_id: uid, to: s?.to, target_unit_id: targetId }
+            if (typeof s?.unit_uid === 'string') combined.unit_uid = s.unit_uid
+            if (typeof targetUid === 'string') combined.target_uid = targetUid
+            if (Number.isFinite(Number(attackId))) combined.attack_id = Number(attackId)
+            result.push(combined)
+            consumed.add(pairedIndex)
+            continue
+          }
+        }
+        result.push(s)
+      }
+      return result
+    } catch { return steps || [] }
+  }
+
   async #stepDecision(actions: any[], gen?: number) {
     if (!Array.isArray(actions) || actions.length === 0) return;
     if ((this as any)._gameOver) { try { console.log('[agent] stepDecision skipped: game_over'); } catch {} return; }
@@ -1180,10 +1370,8 @@ export class AgentModule implements AppModule {
 
     // Intent-driven is now the primary mode
     if (mode === 'intent_driven') {
-      // Always call LLM on own turn if configured
-      if (this.#cfg.alwaysCallLLMOnOwnTurn && this.#isMyTurnStrict(snapshot)) {
-        return await this.#decideIntentDriven(actions, snapshot);
-      }
+      // Prevent re-entrancy while a batch is inflight
+      if (this.#batchInflight) { try { console.log('[agent] skip intent-driven: batch inflight'); } catch {} return null }
       return await this.#decideIntentDriven(actions, snapshot);
     }
 
@@ -1203,8 +1391,12 @@ export class AgentModule implements AppModule {
 
     // Mixed mode: try intent_driven first, then fallback
     try {
-      const intent = await this.#decideIntentDriven(actions, snapshot);
-      if (intent && (intent.actionId != null || intent.deferExecution)) return intent;
+      if (!this.#batchInflight) {
+        const intent = await this.#decideIntentDriven(actions, snapshot);
+        if (intent && (intent.actionId != null || intent.deferExecution)) return intent;
+      } else {
+        try { console.log('[agent] skip intent-driven in mixed mode: batch inflight'); } catch {}
+      }
     } catch {}
 
     const safe = selectSafeAction(actions, snapshot, this.#lastTacticalPreview);
@@ -1843,11 +2035,16 @@ export class AgentModule implements AppModule {
       // Augment: convert simple move into move_then_attack if preview shows a target
       const augmentedSteps = this.#augmentPlanWithMoveThenAttack(Array.isArray(plan.steps) ? plan.steps : [], snapshot);
       const withUids = this.#attachUidsToSteps(augmentedSteps, snapshot)
-      const planPayload = { atomic: false, auto_end: !!plan.auto_end, steps: withUids };
+      const normalized = this.#normalizeStepsForUnity(withUids)
+      const combined = this.#combineMoveAndAttack(normalized)
+      const validated = this.#validateAndFixupAttacks(combined, this.#lastActions||[], snapshot)
+      const planPayload = { atomic: false, auto_end: !!plan.auto_end, steps: validated };
       try { console.log('[agent] 🚚 turn_plan submit', {orig: (plan.steps||[]).length, augmented: (augmentedSteps||[]).length}); } catch {}
       this.#send({type: 'turn_plan', turn_plan: planPayload, req_id: reqId});
       this.#batchInflight = {reqId, ts: Date.now()};
       this.#broadcast('decision_log', {plan: planPayload, info: 'turn_plan submitted (bridge)'});
+      // surface a concrete view for bridge path as well
+      try { this.#broadcast('llm_io', {turn: this.#lastSnapshot?.turn, phase: 'concrete', raw: JSON.stringify({turn_plan: planPayload})}) } catch {}
       this.#turnPlanSteps = []
       return true;
     } catch { return false; }
@@ -2120,7 +2317,13 @@ export class AgentModule implements AppModule {
         const payload = {
           atomic: turnPlan.atomic,
           auto_end: turnPlan.auto_end,
-          steps: turnPlan.steps
+          steps: this.#validateAndFixupAttacks(
+            this.#combineMoveAndAttack(
+              this.#normalizeStepsForUnity(Array.isArray(turnPlan.steps)?turnPlan.steps:[])
+            ),
+            this.#lastActions||[],
+            this.#lastSnapshot
+          )
         };
 
         this.#send({ type: 'turn_plan', turn_plan: payload, req_id: reqId });
@@ -2136,6 +2339,8 @@ export class AgentModule implements AppModule {
           plan: payload,
           info: 'turn_plan submitted'
         });
+        // surface a concrete view for intent-driven path as well
+        try { this.#broadcast('llm_io', {turn: this.#lastSnapshot?.turn, phase: 'concrete', raw: JSON.stringify({turn_plan: payload})}) } catch {}
 
         return {
           mode: 'intent_driven',
@@ -2838,6 +3043,29 @@ export class AgentModule implements AppModule {
           if (moveAttackOpps.length > 0) {
             ;(obs as any).move_attack_opportunities = moveAttackOpps
           }
+          // 追加可执行的 move→attack 组合（包含 id_move/id_attack），用于 LLM 直接使用
+          try {
+            const combos = [] as any[]
+            for (const p of preview) {
+              try {
+                const unitId = Number((p as any)?.unit_id)
+                const toCell = Number((p as any)?.to_cell_index)
+                const idMove = Number((p as any)?.id_move)
+                if (!Number.isFinite(unitId) || !Number.isFinite(toCell)) continue
+                const unitName = this.#findUnitNameById(snapshot, unitId)
+                const atks = Array.isArray((p as any)?.attacks) ? (p as any).attacks : []
+                if (atks.length === 0) continue
+                for (const a of atks) {
+                  const tid = Number((a as any)?.target_unit_id)
+                  const idAtk = Number((a as any)?.id_attack)
+                  if (!Number.isFinite(tid)) continue
+                  const tgtName = this.#findUnitNameById(snapshot, tid) || 'Hero'
+                  combos.push({ unit_id: unitId, unit_name: unitName, to_cell_index: toCell, id_move: Number.isFinite(idMove) ? idMove : undefined, target_unit_id: tid, target_name: tgtName, id_attack: Number.isFinite(idAtk) ? idAtk : undefined })
+                }
+              } catch {}
+            }
+            if (combos.length > 0) (obs as any).move_attack_combos = combos.slice(0, 12)
+          } catch {}
         }
         delete (obs as any).tactical_preview // 删除详细的坐标数据
         // Attach simple advance_targets to guide proactive offense
