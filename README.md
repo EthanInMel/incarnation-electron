@@ -8,7 +8,7 @@
 
 ![IMG_0875](https://github.com/user-attachments/assets/590de304-e2c4-4935-9814-c18ade52fd8e)
 
-
+npm run mastra:dev --workspace @app/main
 # Vite Electron Builder Boilerplate
 
 ![GitHub last commit](https://img.shields.io/github/last-commit/cawa-93/vite-electron-builder?label=last%20update)

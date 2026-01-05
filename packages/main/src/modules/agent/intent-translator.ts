@@ -3,7 +3,15 @@
  */
 
 export interface Intent {
-  type: 'advance_and_attack' | 'direct_attack' | 'defensive_play' | 'aggressive_play' | 'reposition' | 'end_turn';
+  type:
+    | 'advance_and_attack'
+    | 'direct_attack'
+    | 'defensive_play'
+    | 'aggressive_play'
+    | 'reposition'
+    | 'develop_board'
+    | 'hold'
+    | 'end_turn';
   unit?: string;
   target?: string;
   card?: string;
@@ -42,9 +50,20 @@ export function translateIntent(
     case 'aggressive_play':
       return translateAggressivePlay(intent, snapshot, actions);
     
+    case 'develop_board':
+      // “铺场 / 发育场面”，在当前实现中等价于一张偏进攻/节奏向的出牌
+      return translateAggressivePlay(intent, snapshot, actions);
+
     case 'reposition':
       return translateReposition(intent, snapshot, actions);
     
+    case 'hold':
+      // 显式“不动”意图：只用于解释，不产生具体指令
+      console.log(
+        `[IntentTranslator] hold intent for unit=${intent.unit || 'unknown'} (no concrete step)`,
+      );
+      return [];
+
     case 'end_turn':
       return [{ type: 'end_turn' }];
     
@@ -364,18 +383,97 @@ function translateReposition(
   actions: any[]
 ): TurnPlanStep[] {
   try {
-    const unitName = intent.unit || '';
+    const unitName = (intent.unit || '').toLowerCase().trim();
+    const zoneHint = (intent.zone || intent.intent || '').toLowerCase();
+
+    if (!unitName) {
+      console.warn('[IntentTranslator] reposition: missing unit name');
+      return [];
+    }
+
     const selfUnits = snapshot?.self_units || [];
-    const unit = selfUnits.find((u: any) =>
-      (u.label || u.name || '').toLowerCase().includes(unitName.toLowerCase())
-    );
+    const unit = selfUnits.find((u: any) => {
+      const label = (u.label || u.name || '').toLowerCase();
+      return label === unitName || label.includes(unitName) || unitName.includes(label);
+    });
 
     if (!unit) return [];
 
-    // For now, just return empty (Unity will need more logic here)
-    // Could be enhanced with direction-based cell selection
-    console.warn(`[IntentTranslator] reposition not fully implemented yet`);
+    const unitId = unit.unit_id;
+    const moveActions = (actions || []).filter(
+      (a: any) => a?.move_unit && Number(a.move_unit.unit_id) === Number(unitId),
+    );
+
+    if (!moveActions.length) {
+      console.warn('[IntentTranslator] reposition: no move actions available for unit', unitName);
     return [];
+    }
+
+    // Very lightweight scoring based on zone hint; executor/Unity 侧会再做合法性与 combo 规划。
+    const pickBestMove = () => {
+      if (!zoneHint) return moveActions[0];
+      const frontKeywords = ['front', '前', '前排'];
+      const backKeywords = ['back', '后', '後', '后排'];
+
+      const hasFront = frontKeywords.some(k => zoneHint.includes(k));
+      const hasBack = backKeywords.some(k => zoneHint.includes(k));
+
+      // 如果没有明显方向，就直接返回第一个
+      if (!hasFront && !hasBack) return moveActions[0];
+
+      // 尝试使用 snapshot.board.width + hero_cell_index 粗略估计“前/后”
+      const width = Number((snapshot?.board && snapshot.board.width) || 0);
+      const selfHeroIdx =
+        Number(snapshot?.self?.hero_cell_index ?? snapshot?.you?.hero_cell_index ?? -1);
+      const heroY = width > 0 && selfHeroIdx >= 0 ? Math.floor(selfHeroIdx / width) : null;
+
+      const dirY =
+        heroY != null && snapshot?.enemy?.hero_cell_index != null && width > 0
+          ? (() => {
+              const eIdx = Number(snapshot.enemy.hero_cell_index);
+              const eY = eIdx >= 0 ? Math.floor(eIdx / width) : -1;
+              if (eY > heroY) return 1;
+              if (eY < heroY) return -1;
+              return 0;
+            })()
+          : 0;
+
+      const scoreMove = (a: any): number => {
+        const to = a?.move_unit?.to_cell_index;
+        if (!Number.isFinite(Number(to)) || width <= 0 || heroY == null || dirY === 0) return 0;
+        const y = Math.floor(Number(to) / width);
+        const forward = (y - heroY) * dirY;
+        if (hasFront) return forward; // 越靠前越好
+        if (hasBack) return -forward; // 越靠后越好
+        return 0;
+      };
+
+      let best = moveActions[0];
+      let bestScore = -1e9;
+      for (const a of moveActions) {
+        const s = scoreMove(a);
+        if (s > bestScore) {
+          bestScore = s;
+          best = a;
+        }
+      }
+      return best;
+    };
+
+    const chosen = pickBestMove();
+    const toCell = Number(chosen.move_unit.to_cell_index);
+
+    console.log(
+      `[IntentTranslator] ✅ reposition: ${unit.label || unit.name} -> cell ${toCell} (zone="${zoneHint}")`,
+    );
+
+    return [
+      {
+        type: 'move',
+        unit_id: unitId,
+        to: { cell_index: toCell },
+      },
+    ];
   } catch (e) {
     console.error('[IntentTranslator] reposition error:', e);
     return [];

@@ -1,6 +1,19 @@
 import { Box, Button, Flex, Heading, Separator, Text } from '@radix-ui/themes'
 import { useEffect, useMemo, useState } from 'react'
 
+function prettyMode(mode?: string): string {
+  const m = String(mode || '').trim()
+  switch (m) {
+    case 'mastra_smart': return 'Mastra Smart'
+    case 'mastra_deep': return 'Mastra Deep'
+    case 'fast_only': return 'Fast Only'
+    case 'llm_only': return 'LLM Only'
+    case 'smart': return 'Smart'
+    case 'intent_driven': return 'Mastra (legacy cfg)'
+    default: return m || '—'
+  }
+}
+
 export default function Agent() {
   const [logs, setLogs] = useState<string[]>([])
   const [paused, setPaused] = useState<boolean>(false)
@@ -18,9 +31,9 @@ export default function Agent() {
     }
     const onExplain = (_: any, data: any) => {
       const why = data?.why ? ` why=${String(data.why).slice(0,120)}` : ''
-      const ln = `[Explain] mode=${data?.mode ?? ''} temp=${data?.temp ?? ''}${why}`
+      const ln = `[Explain] mode=${prettyMode(data?.mode)} temp=${data?.temp ?? ''}${why}`
       setLogs(prev => [...prev.slice(-200), ln])
-      setRt(prev => ({...prev, mode: String(data?.mode ?? ''), temp: data?.temp != null ? String(data.temp) : prev.temp, steps: data?.steps != null ? String(data.steps) : prev.steps, turn: data?.turn != null ? String(data.turn) : prev.turn}))
+      setRt(prev => ({...prev, mode: prettyMode(data?.mode), temp: data?.temp != null ? String(data.temp) : prev.temp, steps: data?.steps != null ? String(data.steps) : prev.steps, turn: data?.turn != null ? String(data.turn) : prev.turn}))
       if (data?.actionId) {
         setDecisions(prev => [...prev, { ts: Date.now(), actionId: data.actionId, text: undefined, why: data?.why, turn: String(data?.turn ?? ''), gen: data?.gen }].slice(-500))
       }

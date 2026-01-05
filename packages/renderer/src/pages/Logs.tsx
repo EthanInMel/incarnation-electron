@@ -7,7 +7,7 @@ export default function Logs() {
   const [strategy, setStrategy] = useState<any>(null)
   const [outcomes, setOutcomes] = useState<Array<{ts:number; actionId:number; delta:any}>>([])
   const [actionsSummary, setActionsSummary] = useState<any|null>(null)
-  const [llmIO, setLlmIO] = useState<Array<{ts:number; turn?:number; phase?:string; usage?:any; raw?:string}>>([])
+  const [llmIO, setLlmIO] = useState<Array<{ts:number; turn?:number; phase?:string; usage?:any; raw?:string; prompt?:any}>>([])
   const [planResults, setPlanResults] = useState<Array<{ts:number; turn?:number; atomic:boolean; note?:string; steps:Array<{id:number; ok:boolean; reason?:string|null; desc?:string}>}>>([])
   const [turnSnapshots, setTurnSnapshots] = useState<Array<{turn:number; snapshot:any}>>([])
   const [idDesc, setIdDesc] = useState<Record<number, string>>({})
@@ -87,7 +87,7 @@ export default function Logs() {
       if (e?.strategy) setStrategy(e.strategy)
     }
     const onLlmIO = (d: any) => {
-      setLlmIO(prev => [...prev.slice(-99), {ts: Date.now(), turn: d?.turn, phase: d?.phase, usage: d?.usage, raw: d?.raw}])
+      setLlmIO(prev => [...prev.slice(-99), {ts: Date.now(), turn: d?.turn, phase: d?.phase, usage: d?.usage, raw: d?.raw, prompt: d?.prompt}])
       const pt = d?.usage?.prompt_tokens ?? d?.usage?.promptTokens
       const ct = d?.usage?.completion_tokens ?? d?.usage?.completionTokens
       pushLive(`[LLM] turn=${d?.turn ?? ''} phase=${d?.phase ?? ''} usage p=${pt ?? ''} c=${ct ?? ''}`)
@@ -202,8 +202,16 @@ export default function Logs() {
             const ioRaw = llmIO.filter(e=> e.turn === t.turn)
             const ioSeen = new Set<string>()
             const relatedIO = ioRaw.filter(e=>{ const key = `${e.phase}|${e.raw||''}`; if (ioSeen.has(key)) return false; ioSeen.add(key); return true; })
-            const highLevel = relatedIO.filter(e=> e.phase === 'hier_policy')
-            const initialIO = relatedIO.filter(e=> e.phase === 'initial' || e.phase === 'retry' || e.phase === 'concrete')
+            const promptIO = relatedIO.filter(e=> typeof e.phase === 'string' && e.phase.startsWith('prompt_'))
+            const highLevel = relatedIO.filter(e=>
+              e.phase === 'hier_policy' ||
+              e.phase === 'intent_mastra_candidates' ||
+              e.phase === 'semantic_state' ||
+              e.phase === 'semantic_intents' ||
+              e.phase === 'semantic_solver'
+            )
+            const initialIO = relatedIO.filter(e=> e.phase === 'initial' || e.phase === 'retry' || e.phase === 'concrete' || e.phase === 'intent_mastra_single')
+            const otherIO = relatedIO.filter(e=> !promptIO.includes(e) && !highLevel.includes(e) && !initialIO.includes(e))
             // Deduplicate plans by note+steps signature
             const plansRaw = planResults.filter(p=> p.turn === t.turn)
             const planSeen = new Set<string>()
@@ -219,27 +227,63 @@ export default function Logs() {
                     <div className="font-semibold">1) Unity Snapshot</div>
                     <pre className="whitespace-pre-wrap overflow-auto max-h-60 p-2 bg-black/10 rounded">{JSON.stringify(t.snapshot, null, 2)}</pre>
                   </div>
+                  {!!promptIO.length && (
+                    <div className="mb-2">
+                      <div className="font-semibold">2) LLM Prompts (Inputs)</div>
+                      <div className="pl-2">
+                        {promptIO.map((e,idx)=>(
+                          <div key={idx} className="mt-1 p-2 bg-black/10 rounded">
+                            <div>phase={e.phase}</div>
+                            {e.prompt && <pre className="whitespace-pre-wrap overflow-auto max-h-40 mt-1">{JSON.stringify(e.prompt, null, 2)}</pre>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   <div className="mb-2">
-                    <div className="font-semibold">2) LLM Responses</div>
+                    <div className="font-semibold">3) LLM Responses</div>
                     <div className="pl-2">
-                      <div className="font-medium">2.1) High-level Policy</div>
+                      <div className="font-medium text-amber-400">3.1) High-level / Candidates</div>
                       {highLevel.length === 0 ? <div className="opacity-70">(none)</div> : highLevel.map((e,idx)=>(
                         <div key={idx} className="mt-1 p-2 bg-black/10 rounded">
-                          <div>phase={e.phase} usage={e.usage ? JSON.stringify(e.usage) : ''}</div>
-                          {e.raw && <pre className="whitespace-pre-wrap overflow-auto max-h-40 mt-1">{e.raw}</pre>}
+                          <div className="text-emerald-300 font-medium">
+                            phase=<span className="font-bold">{e.phase}</span> {e.usage ? `usage=${JSON.stringify(e.usage)}` : ''}
+                          </div>
+                          {e.raw && <pre className="whitespace-pre-wrap overflow-auto max-h-40 mt-1 text-emerald-200">{e.raw}</pre>}
                         </div>
                       ))}
-                      <div className="font-medium mt-2">2.2) Concrete Plan</div>
+                      <div className="font-medium mt-2 text-sky-400">3.2) Concrete Plan / Single Intent</div>
                       {initialIO.length === 0 ? <div className="opacity-70">(none)</div> : initialIO.map((e,idx)=>(
                         <div key={idx} className="mt-1 p-2 bg-black/10 rounded">
-                          <div>phase={e.phase} usage={e.usage ? JSON.stringify(e.usage) : ''}</div>
-                          {e.raw && <pre className="whitespace-pre-wrap overflow-auto max-h-40 mt-1">{e.raw}</pre>}
+                          <div className="text-cyan-300 font-medium">
+                            phase=<span className="font-bold">{e.phase}</span> {e.usage ? `usage=${JSON.stringify(e.usage)}` : ''}
+                          </div>
+                          {e.raw && <pre className="whitespace-pre-wrap overflow-auto max-h-40 mt-1 text-cyan-200">{e.raw}</pre>}
                         </div>
                       ))}
+                      {otherIO.length > 0 && (
+                        <div className="font-medium mt-2 text-purple-300">3.3) Other LLM Phases</div>
+                      )}
+                      {otherIO.map((e,idx)=>(
+                        <div key={idx} className="mt-1 p-2 bg-black/10 rounded">
+                          <div className={String(e.phase||'').startsWith('error') ? 'text-red-400 font-semibold' : 'text-purple-200 font-medium'}>
+                            phase=<span className="font-bold">{e.phase}</span> {e.usage ? `usage=${JSON.stringify(e.usage)}` : ''}
+                          </div>
+                          {e.raw && <pre className={"whitespace-pre-wrap overflow-auto max-h-40 mt-1 " + (String(e.phase||'').startsWith('error') ? 'text-red-300' : 'text-purple-100')}>{e.raw}</pre>}
+                          {!e.raw && String(e.phase||'').startsWith('error') && (
+                            <div className="text-red-300 mt-1">(LLM 未返回正文，错误原因见上方 error 堆栈)</div>
+                          )}
+                        </div>
+                      ))}
+                      {relatedIO.length === 0 && (
+                        <div className="mt-1 text-red-300">
+                          (本回合没有任何 LLM 响应；可能是决策走了 fast_only、provider 配置缺失，或在调用前就被规则引擎截断)
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div className="mb-2">
-                    <div className="font-semibold">3) Unity Execution</div>
+                    <div className="font-semibold">4) Unity Execution</div>
                     {relatedPlans.length === 0 && relatedBatches.length === 0 ? <div className="opacity-70">(no plan_result)</div> : null}
                     {relatedPlans.map((p,idx)=> (
                       <div key={idx} className="mt-1 p-2 bg-black/10 rounded">

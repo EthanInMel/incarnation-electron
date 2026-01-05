@@ -28,6 +28,7 @@ export default function AppLayout(_props: PropsWithChildren) {
           <NavItem to="/presets" label="Presets" />
           <NavItem to="/llm" label="LLM History" />
           <NavItem to="/sessions" label="Sessions" />
+          <NavItem to="/card-hints" label="Card Hints" />
           <Separator my="2" size="4" />
           <NavItem to="/settings" label="Settings" />
         </nav>

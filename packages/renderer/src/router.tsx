@@ -10,6 +10,7 @@ const Presets = lazy(() => import('./pages/Presets'))
 const Settings = lazy(() => import('./settings/Settings'))
 const LLMHistory = lazy(() => import('./pages/LLMHistory'))
 const Sessions = lazy(() => import('./pages/Sessions'))
+const CardHints = lazy(() => import('./pages/CardHints'))
 
 const rootRoute = createRootRoute({
   component: () => (
@@ -89,6 +90,16 @@ const sessionsRoute = createRoute({
   ),
 })
 
+const cardHintsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/card-hints',
+  component: () => (
+    <Suspense fallback={<div className="p-4">Loading...</div>}>
+      <CardHints />
+    </Suspense>
+  ),
+})
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   agentRoute,
@@ -97,6 +108,7 @@ const routeTree = rootRoute.addChildren([
   settingsRoute,
   llmHistoryRoute,
   sessionsRoute,
+  cardHintsRoute,
 ])
 
 export const router = createRouter({

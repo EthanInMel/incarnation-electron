@@ -1,5 +1,6 @@
 import axios from 'axios';
-import type {AgentConfig} from './types.js';
+import type { AgentConfig } from './types.js';
+import { buildHintsPromptBlock } from './card-hint-client.js';
 
 function getDefaultBaseUrl(provider: string): string {
   const p = String(provider || '').toLowerCase();
@@ -9,7 +10,7 @@ function getDefaultBaseUrl(provider: string): string {
 }
 
 export async function callDispatcher(cfg: AgentConfig, payload: any) {
-  const prov = String(cfg.provider||'').toLowerCase()
+  const prov = String(cfg.provider || '').toLowerCase()
   // Dispatcher mode: treat baseUrl as dispatcher host and call /dispatch
   if (prov === 'dispatcher') {
     const endpoint = '/dispatch'
@@ -31,7 +32,7 @@ export async function callDispatcher(cfg: AgentConfig, payload: any) {
         }
         return await client.post(endpoint, body)
       } catch (e) {
-        lastErr = e; await new Promise(r=> setTimeout(r, 500*(attempt+1))); attempt++
+        lastErr = e; await new Promise(r => setTimeout(r, 500 * (attempt + 1))); attempt++
       }
     }
     if (lastErr) throw lastErr
@@ -49,6 +50,13 @@ export async function callDispatcher(cfg: AgentConfig, payload: any) {
       const timeout = Math.max(5000, Math.min(60000, Number((cfg as any).policyTimeoutMs || cfg.maxTurnMs || 15000)));
       const headers: Record<string, string> = { 'Content-Type': 'application/json; charset=utf-8' };
       if ((cfg as any).apiKey) headers.Authorization = `Bearer ${(cfg as any).apiKey}`;
+      // For custom OpenAI-compatible gateways: allow routing via headers like x-provider / x-upstream-provider
+      if (cfg.upstreamProvider) {
+        headers['x-upstream-provider'] = String(cfg.upstreamProvider);
+        headers['x-provider'] = String(cfg.upstreamProvider);
+      } else if (cfg.provider) {
+        headers['x-provider'] = String(cfg.provider);
+      }
 
       const client = axios.create({ baseURL, timeout, headers });
       // Ensure model and safety defaults
@@ -57,7 +65,7 @@ export async function callDispatcher(cfg: AgentConfig, payload: any) {
       if (typeof body.temperature !== 'number' && typeof cfg.temperature === 'number') body.temperature = cfg.temperature;
       if (typeof body.max_tokens !== 'number' && typeof cfg.maxTokens === 'number') body.max_tokens = cfg.maxTokens;
       // SiliconFlow requires enable_thinking=false for function/tool calls; keep compatible defaults
-      if (String(cfg.provider||'').toLowerCase()==='siliconflow' && body.tools) {
+      if (String(cfg.provider || '').toLowerCase() === 'siliconflow' && body.tools) {
         if (typeof body.enable_thinking === 'undefined') body.enable_thinking = false
       }
 
@@ -74,47 +82,104 @@ export async function callDispatcher(cfg: AgentConfig, payload: any) {
     ? 'SiliconFlow 调用失败，请检查 API Key 与模型是否正确。文档: https://docs.siliconflow.cn/cn/api-reference/'
     : 'OpenAI 调用失败，请检查 API Key 与模型是否正确。';
   if (lastErr) {
-    try { (lastErr as any).hint = hint } catch {}
+    try { (lastErr as any).hint = hint } catch { }
     throw lastErr
   }
   const err = new Error(hint)
   throw err
 }
 
-export function buildPolicyPrompt(observation:any, snapshot:any, cfg: AgentConfig, clampTemp:(v:number)=>number) {
+export function buildPolicyPrompt(observation: any, snapshot: any, cfg: AgentConfig, clampTemp: (v: number) => number, strategy?: any) {
   // Optional feedback block based on last plan execution
   let feedbackBlock = ''
   try {
     const g: any = (globalThis as any)
     const fb: any = g.__agent_last_feedback
     if (fb) {
-      const failedSteps = Array.isArray(fb.steps) ? fb.steps.filter((s:any)=>!s?.ok) : []
+      const failedSteps = Array.isArray(fb.steps) ? fb.steps.filter((s: any) => !s?.ok) : []
       const failedIds = Array.isArray(fb.failed) ? fb.failed : []
       if ((failedSteps && failedSteps.length) || (failedIds && failedIds.length)) {
         const reasonLines: string[] = []
         try {
-          for (const s of (failedSteps||[])) {
+          for (const s of (failedSteps || [])) {
             const id = s?.id
             const rsn = s?.reason
             const desc = s?.desc
-            reasonLines.push(`- id=${id} ${desc?`(${desc})`:''} reason=${rsn||'unknown'}`.trim())
+            reasonLines.push(`- id=${id} ${desc ? `(${desc})` : ''} reason=${rsn || 'unknown'}`.trim())
           }
-        } catch {}
+        } catch { }
         if (Array.isArray(failedIds) && failedIds.length) reasonLines.push(`- failed ids: ${failedIds.join(', ')}`)
-        feedbackBlock = ['','⚠️ 上回合失败动作（避免重复）：', ...reasonLines].join('\n')
+        feedbackBlock = ['', '⚠️ 上回合失败动作（避免重复）：', ...reasonLines].join('\n')
       }
     }
-  } catch {}
+  } catch { }
+
+  const baseSystemPrompt = [
+    'You are a tactical AI for a hero-based card battler tactics game.',
+    'Return ONLY valid JSON (no markdown, no extra text).',
+    'Goal priority: protect your Hero, remove threats, then pressure/kill enemy Hero.',
+    'CRITICAL: never invent cards/units/positions. Use only the observation below.',
+    'OUTPUT CONSTRAINTS: your returned JSON steps MUST NOT contain ids (card_id/unit_id/cell_index) or coordinates (row/col/rXcY).',
+    'Use ONLY English card/unit names from the observation and the allowed "hint" fields.',
+    'Newly played units cannot attack in the same plan.',
+  ].join(' ');
+
+  const playerTacticsBlock = (() => {
+    try {
+      const s = String((cfg as any)?.systemPrompt || '').trim()
+      if (!s) return ''
+      return ['','🧠 玩家战术偏好（不允许违反合法性/可用动作，仅作倾向）:', s].join('\n')
+    } catch { return '' }
+  })()
+
+  const hintsBlock = (() => {
+    try {
+      const hb = buildHintsPromptBlock(snapshot)
+      if (!hb) return ''
+      return ['','🧠 玩家自定义卡牌提示词（cards hints）:', hb].join('\n')
+    } catch { return '' }
+  })()
+
+  const fmtUnit = (u: any) => {
+    try {
+      const nm = u?.label || u?.name || ''
+      const hp = Number(u?.hp)
+      const atk = Number(u?.atk || 0)
+      const pos = u?.pos || u?.position || ''
+      const zone = u?.zone_from_self
+      const rank = u?.rank_from_self_hero
+      const dS = u?.distance_to_self_hero
+      const dE = u?.distance_to_enemy_hero
+      const parts: string[] = []
+      if (Number.isFinite(hp)) parts.push(`hp:${hp}`)
+      if (Number.isFinite(atk)) parts.push(`atk:${atk}`)
+      if (pos) parts.push(`pos:${pos}`)
+      if (zone != null) parts.push(`zone:${zone}`)
+      if (rank != null && Number.isFinite(Number(rank))) parts.push(`rank:${rank}`)
+      if (dS != null && Number.isFinite(Number(dS))) parts.push(`dSelf:${dS}`)
+      if (dE != null && Number.isFinite(Number(dE))) parts.push(`dEnemy:${dE}`)
+      const can = u?.can_attack ? ' ⚔️' : ''
+      return parts.length ? `${nm}${can}(${parts.join(', ')})` : `${nm}${can}`
+    } catch { return String(u?.label || u?.name || '') }
+  }
 
   const rules = [
     '🎯 CRITICAL: Return ONLY valid JSON in this EXACT format:',
     '{ "analysis": "brief situation summary", "steps": [Step1, Step2, ...] }',
     '',
-    '🏆 GAME STATE:',
-    `- YOUR HERO HP: ${observation?.you?.hero_hp || 0} ${observation?.you?.hero_position ? `(at ${observation.you.hero_position})` : ''}`,
-    `- ENEMY HERO HP: ${observation?.opponent?.hero_hp || 0} ${observation?.opponent?.hero_position ? `(at ${observation.opponent.hero_position})` : ''}`,
+    '🏆 GAME STATE (positions shown here are for understanding ONLY — do NOT output coordinates in your steps):',
+    `- YOUR HERO HP: ${observation?.you?.hero_hp || 0} ${observation?.you?.hero_position ? `(pos ${observation.you.hero_position})` : ''}`,
+    `- ENEMY HERO HP: ${observation?.opponent?.hero_hp || 0} ${observation?.opponent?.hero_position ? `(pos ${observation.opponent.hero_position})` : ''}`,
     '- ⚠️ If your Hero HP is low, prioritize DEFENSE! Deploy units to block enemy attacks.',
     '- 🎯 If enemy Hero HP is low, prioritize OFFENSE! Attack enemy Hero to win!',
+    playerTacticsBlock,
+    hintsBlock,
+    (() => {
+      try {
+        if (!strategy) return ''
+        return ['', '🧭 对局策略（多回合持续，除非明确重新规划，否则遵守这些约束/倾向）:', JSON.stringify(strategy)].join('\n')
+      } catch { return '' }
+    })(),
     '',
     '📝 Step Types (use EXACT field names):',
     '1. Play a card: { "type": "play", "card": "Tryx", "hint": "defensive_center" }',
@@ -139,41 +204,41 @@ export function buildPolicyPrompt(observation:any, snapshot:any, cfg: AgentConfi
     '',
     '4. End turn: { "type": "end_turn" }',
     '',
-    '❌ NEVER use: card_id, unit_id, cell_index, rXcY coordinates',
-    '✅ ALWAYS use: English card/unit names from observation below',
+    '❌ NEVER output: card_id, unit_id, cell_index, row/col, rXcY coordinates',
+    '✅ ALWAYS output: English card/unit names from observation below + allowed hints',
     '✅ Keep steps sequenced: Deploy defenders → Move to attack range → Attack → End',
     '✅ Max 6 steps for reliability',
     '',
     '🎮 Available cards in hand:',
-    (Array.isArray(observation?.you?.hand) ? observation.you.hand.map((c:any)=> `${c?.name}(cost:${c?.mana_cost||0})`).filter(Boolean).join(', ') : 'none'),
+    (Array.isArray(observation?.you?.hand) ? observation.you.hand.map((c: any) => `${c?.name}(cost:${c?.mana_cost || 0})`).filter(Boolean).join(', ') : 'none'),
     `(Your mana: ${observation?.you?.mana || 0})`,
     '',
-    '🎮 Your units ALREADY on board:',
-    (Array.isArray(observation?.self_units) && observation.self_units.length > 0 
-      ? observation.self_units.map((u:any)=> `${u?.label||u?.name}(hp:${u?.hp}/${u?.max_hp||u?.hp}, atk:${u?.atk||0}${u?.can_attack?' ⚔️':''})`).filter(Boolean).join(', ')
+    '🎮 Your units ALREADY on board (include position/zone for reasoning):',
+    (Array.isArray(observation?.self_units) && observation.self_units.length > 0
+      ? observation.self_units.map(fmtUnit).filter(Boolean).join(', ')
       : 'NONE - no units on board yet!'),
-    (()=>{
-      const canAttack = (observation?.self_units||[]).filter((u:any)=>u?.can_attack)
-      const canAttackDirectly = canAttack.filter((u:any)=>{
+    (() => {
+      const canAttack = (observation?.self_units || []).filter((u: any) => u?.can_attack)
+      const canAttackDirectly = canAttack.filter((u: any) => {
         // 检查这个单位是否在move_attack_opportunities中（需要移动才能攻击）
-        const needsMove = (observation?.move_attack_opportunities||[]).some((opp:any)=>
-          String(opp?.unit||'').toLowerCase().includes(String(u?.label||u?.name||'').toLowerCase().split('#')[0])
+        const needsMove = (observation?.move_attack_opportunities || []).some((opp: any) =>
+          String(opp?.unit || '').toLowerCase().includes(String(u?.label || u?.name || '').toLowerCase().split('#')[0])
         )
         return !needsMove
       })
-      const needsMovement = canAttack.filter((u:any)=>{
-        const needsMove = (observation?.move_attack_opportunities||[]).some((opp:any)=>
-          String(opp?.unit||'').toLowerCase().includes(String(u?.label||u?.name||'').toLowerCase().split('#')[0])
+      const needsMovement = canAttack.filter((u: any) => {
+        const needsMove = (observation?.move_attack_opportunities || []).some((opp: any) =>
+          String(opp?.unit || '').toLowerCase().includes(String(u?.label || u?.name || '').toLowerCase().split('#')[0])
         )
         return needsMove
       })
-      
+
       const lines = []
       if (canAttackDirectly.length > 0) {
-        lines.push(`   ⚔️ Can attack NOW: ${canAttackDirectly.map((u:any)=>u?.label||u?.name).join(', ')}`)
+        lines.push(`   ⚔️ Can attack NOW: ${canAttackDirectly.map((u: any) => u?.label || u?.name).join(', ')}`)
       }
       if (needsMovement.length > 0) {
-        lines.push(`   🚶 Need to MOVE first: ${needsMovement.map((u:any)=>u?.label||u?.name).join(', ')} - check "Move→Attack Opportunities" below!`)
+        lines.push(`   🚶 Need to MOVE first: ${needsMovement.map((u: any) => u?.label || u?.name).join(', ')} - check "Move→Attack Opportunities" below!`)
       }
       if (canAttack.length === 0) {
         lines.push('   ❌ NO units ready to attack - DO NOT output any "attack" steps this turn!')
@@ -181,13 +246,13 @@ export function buildPolicyPrompt(observation:any, snapshot:any, cfg: AgentConfi
       return lines.join('\n')
     })(),
     '',
-    '🎯 Enemy units threatening you:',
-    (Array.isArray(observation?.enemy_units) ? observation.enemy_units.map((u:any)=> `${u?.label||u?.name}(hp:${u?.hp}/${u?.max_hp||u?.hp}, atk:${u?.atk||0})`).filter(Boolean).join(', ') : 'none'),
+    '🎯 Enemy units (include position/zone for reasoning):',
+    (Array.isArray(observation?.enemy_units) ? observation.enemy_units.map(fmtUnit).filter(Boolean).join(', ') : 'none'),
     '',
     ...(observation?.move_attack_opportunities?.length > 0 ? [
       '',
       '💡 Move→Attack Opportunities (HIGH PRIORITY!):',
-      observation.move_attack_opportunities.map((opp:any) => 
+      observation.move_attack_opportunities.map((opp: any) =>
         `- ${opp.unit} → can attack: ${opp.can_attack.join(' or ')}`
       ).join('\n'),
       '🎯 Use these! Add move step for the unit, then attack step for the target!',
@@ -195,25 +260,14 @@ export function buildPolicyPrompt(observation:any, snapshot:any, cfg: AgentConfi
     ] : []),
   ].join('\n') + feedbackBlock;
 
-  const systemPrompt = [
-    'You are a tactical AI for a HERO-BASED card battler game.',
-    '🎯 WIN CONDITION: Reduce enemy Hero HP to 0 while protecting YOUR Hero.',
-    'Heroes are fixed units on the board - deploy units to SHIELD your Hero and STRIKE enemy Hero.',
-    'Your job: Generate a concise, EXECUTABLE action plan in strict JSON.',
-    'The executor will translate card/unit NAMES to IDs automatically.',
-    'Strategy priority: 1) Protect your Hero from enemy units, 2) Remove threats, 3) Attack enemy Hero.',
-    '⚠️ CRITICAL: Only use units ALREADY on board for attack steps. Newly played cards cannot attack in the same turn plan.',
-    'Keep it simple and sequential (deploy → attack → end).',
-  ].join(' ');
-
   return {
     model: cfg.model,
     messages: [
-      {role:'system', content: systemPrompt},
-      {role:'user', content: rules},
+      { role: 'system', content: baseSystemPrompt },
+      { role: 'user', content: rules },
       // Extra hint: provide executable combos to encourage move_then_attack
       ...(Array.isArray((observation as any)?.move_attack_combos) && (observation as any).move_attack_combos.length > 0 ? [
-        { role: 'user', content: 'Executable move→attack combos (prefer these when generating steps):\n' + JSON.stringify((observation as any).move_attack_combos.slice(0,8)) }
+        { role: 'user', content: 'Executable move→attack combos (prefer these when generating steps):\n' + JSON.stringify((observation as any).move_attack_combos.slice(0, 8)) }
       ] : []),
     ],
     temperature: clampTemp(cfg.temperature ?? 0.15),
@@ -221,7 +275,7 @@ export function buildPolicyPrompt(observation:any, snapshot:any, cfg: AgentConfi
   };
 }
 
-export function buildIntentPrompt(snapshot:any, observation:any, actions:any[], buildActionsForPrompt:(acts:any[])=>any[]) {
+export function buildIntentPrompt(snapshot: any, observation: any, actions: any[], buildActionsForPrompt: (acts: any[]) => any[]) {
   try {
     const parts: string[] = [];
     // Inject last-turn feedback
@@ -229,13 +283,13 @@ export function buildIntentPrompt(snapshot:any, observation:any, actions:any[], 
       const g: any = (globalThis as any)
       const fb: any = g.__agent_last_feedback
       if (fb) {
-        const failedSteps = Array.isArray(fb.steps) ? fb.steps.filter((s:any)=>!s?.ok) : []
+        const failedSteps = Array.isArray(fb.steps) ? fb.steps.filter((s: any) => !s?.ok) : []
         const failedIds = Array.isArray(fb.failed) ? fb.failed : []
         if ((failedSteps && failedSteps.length) || (failedIds && failedIds.length)) {
           parts.push('⚠️ 上回合失败动作（避免重复）：')
           if (failedSteps && failedSteps.length) {
             for (const s of failedSteps) {
-              parts.push(`- id=${s?.id} ${s?.desc?`(${s.desc})`:''} reason=${s?.reason||'unknown'}`)
+              parts.push(`- id=${s?.id} ${s?.desc ? `(${s.desc})` : ''} reason=${s?.reason || 'unknown'}`)
             }
           }
           if (failedIds && failedIds.length) {
@@ -244,8 +298,8 @@ export function buildIntentPrompt(snapshot:any, observation:any, actions:any[], 
           parts.push('请不要重复上述失败方案，改用其他可用动作/落点。\n')
         }
       }
-    } catch {}
-    
+    } catch { }
+
     // 统计可用动作类型
     const actionTypes = {
       play_card: actions.filter(a => a?.play_card).length,
@@ -253,7 +307,7 @@ export function buildIntentPrompt(snapshot:any, observation:any, actions:any[], 
       unit_attack: actions.filter(a => a?.unit_attack).length,
       hero_power: actions.filter(a => a?.hero_power).length,
     };
-    
+
     const stateText = snapshot?.summary_text;
     const actionsText = snapshot?.actions_text;
     if (stateText) {
@@ -264,7 +318,7 @@ export function buildIntentPrompt(snapshot:any, observation:any, actions:any[], 
       parts.push('可行动压缩视图（actions_text）:');
       parts.push(String(actionsText));
     }
-    
+
     // 添加动作可用性提示
     parts.push('\n⚠️ 可用动作类型:');
     parts.push(`- 出牌: ${actionTypes.play_card} 个可选`);
@@ -272,19 +326,28 @@ export function buildIntentPrompt(snapshot:any, observation:any, actions:any[], 
     parts.push(`- 攻击: ${actionTypes.unit_attack} 个可选`);
     parts.push(`- 英雄技能: ${actionTypes.hero_power > 0 ? '✅ 可用' : '❌ 未就绪（不要输出 hero_power）'}`);
     parts.push('只能从 available_actions 中选择存在的动作！\n');
-    
+
+    // 添加玩家自定义的卡牌 AI 提示词
+    try {
+      const hintsBlock = buildHintsPromptBlock(snapshot);
+      if (hintsBlock) {
+        parts.push('🧠 玩家自定义卡牌策略:');
+        parts.push(hintsBlock);
+      }
+    } catch { }
+
     parts.push('战局观测（JSON）:');
     parts.push(JSON.stringify(observation, null, 0));
     const pruned = buildActionsForPrompt(actions);
     // Aggregate explicit attack and move options to make tool-use easier
     try {
-      const atk = Array.isArray(actions) ? actions.filter((a:any)=>a?.unit_attack).map((a:any)=>({attacker_unit_id:a.unit_attack.attacker_unit_id, target_unit_id:a.unit_attack.target_unit_id})) : []
-      const mv = Array.isArray(actions) ? actions.filter((a:any)=>a?.move_unit).map((a:any)=>({unit_id:a.move_unit.unit_id, to_cell_index:a.move_unit.to_cell_index})) : []
+      const atk = Array.isArray(actions) ? actions.filter((a: any) => a?.unit_attack).map((a: any) => ({ attacker_unit_id: a.unit_attack.attacker_unit_id, target_unit_id: a.unit_attack.target_unit_id })) : []
+      const mv = Array.isArray(actions) ? actions.filter((a: any) => a?.move_unit).map((a: any) => ({ unit_id: a.move_unit.unit_id, to_cell_index: a.move_unit.to_cell_index })) : []
       parts.push('\n可攻击选项（仅可从中选择）:')
       parts.push(JSON.stringify(atk))
       parts.push('可移动选项（仅可从中选择）:')
       parts.push(JSON.stringify(mv))
-    } catch {}
+    } catch { }
     parts.push('available_actions（精简JSON，必须从中选择）:');
     parts.push(JSON.stringify(pruned, null, 0));
     parts.push('请输出严格 JSON turn_plan（不含多余文本）。');
@@ -338,7 +401,7 @@ export function parseActionId(text: string | null, actions: any[]): number | nul
       if (typeof (obj as any).action_id === 'number') return (obj as any).action_id;
       if ((obj as any).action && typeof (obj as any).action.id === 'number') return (obj as any).action.id;
     }
-  } catch {}
+  } catch { }
   const m = /Action:\s*(\d+)/i.exec(text);
   if (m) return Number(m[1]);
   const num = Number(String(text).trim());

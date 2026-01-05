@@ -8,13 +8,17 @@ type AgentConfig = {
   apiKey?: string
   baseUrl: string
   bridgeToken?: string
+  upstreamProvider?: string
+  decisionPipeline?: 'legacy' | 'semantic_v2'
   temperature: number
   maxTokens: number
   maxSteps: number
   maxTurnMs: number
   endpoint?: string
   systemPrompt?: string
-  decisionMode?: 'intent'|'hierarchical'|'policy_only'
+  decisionMode?: 'fast_only' | 'mastra_smart' | 'mastra_deep' | 'smart' | 'llm_only' |
+    // legacy modes still accepted for backward compatibility
+    'intent' | 'hierarchical' | 'policy_only' | 'mixed' | 'intent_driven'
   strategyProfile?: 'balanced'|'aggressive'|'defensive'
   adaptiveTemp?: boolean
   minTemp?: number
@@ -35,7 +39,8 @@ export default function Settings() {
   const [cfg, setCfg] = useState<AgentConfig>({
     provider: 'openai', model: 'gpt-4o-mini', baseUrl: 'https://api.openai.com/v1', bridgeToken: 'dev',
     temperature: 0.2, maxTokens: 512, maxSteps: 6, maxTurnMs: 12000,
-    decisionMode: 'intent', strategyProfile: 'balanced', adaptiveTemp: true, minTemp: 0.1, maxTemp: 0.7,
+    decisionMode: 'mastra_smart', strategyProfile: 'balanced', adaptiveTemp: true, minTemp: 0.1, maxTemp: 0.7,
+    decisionPipeline: 'semantic_v2',
     knowledge: { weight: 0.6 }, nBest: 1, nBestParallel: false, maxActions: 24,
   })
 
@@ -231,6 +236,14 @@ export default function Settings() {
                 <Text>Endpoint</Text>
                 <TextField.Root value={cfg.endpoint||'chat/completions'} onChange={(e) => update('endpoint', e.target.value)} />
               </Flex>
+              <Flex direction="column">
+                <Text>x-provider (upstream provider)</Text>
+                <TextField.Root
+                  placeholder="e.g. deepseek / moonshot / openai"
+                  value={cfg.upstreamProvider || ''}
+                  onChange={(e) => update('upstreamProvider', e.target.value)}
+                />
+              </Flex>
             </Flex>
             <Text size="1">SiliconFlow 文档见 <a href="https://docs.siliconflow.cn/cn/api-reference/" target="_blank" rel="noreferrer">docs.siliconflow.cn</a>；请选择 Chat Completions 接口。</Text>
 
@@ -268,14 +281,21 @@ export default function Settings() {
 
         <Tabs.Content value="decision">
           <Flex gap="3" wrap="wrap" align="center">
-            <Select.Root value={cfg.decisionMode||'intent'} onValueChange={(v) => update('decisionMode', v as any)}>
+            <Select.Root value={cfg.decisionPipeline||'semantic_v2'} onValueChange={(v) => update('decisionPipeline', v as any)}>
               <Select.Trigger />
               <Select.Content>
-                <Select.Item value="intent">Intent</Select.Item>
-                <Select.Item value="hierarchical">Hierarchical</Select.Item>
-                <Select.Item value="policy_only">Policy Only</Select.Item>
-                <Select.Item value="mixed">Mixed</Select.Item>
-                <Select.Item value="intent_driven">Intent Driven</Select.Item>
+                <Select.Item value="semantic_v2">Decision Pipeline: Semantic v2 (新系统)</Select.Item>
+                <Select.Item value="legacy">Decision Pipeline: Legacy (旧系统)</Select.Item>
+              </Select.Content>
+            </Select.Root>
+
+            <Select.Root value={cfg.decisionMode||'mastra_smart'} onValueChange={(v) => update('decisionMode', v as any)}>
+              <Select.Trigger />
+              <Select.Content>
+                <Select.Item value="mastra_smart">Mastra Smart (推荐)</Select.Item>
+                <Select.Item value="mastra_deep">Mastra Deep (更强但更慢)</Select.Item>
+                <Select.Item value="fast_only">Fast Only (纯规则)</Select.Item>
+                <Select.Item value="llm_only">LLM Only (跳过规则)</Select.Item>
               </Select.Content>
             </Select.Root>
 
